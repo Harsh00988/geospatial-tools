@@ -1,0 +1,27 @@
+# Rust
+**/target/
+**/*.rs.bk
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local geospatial test data
+*.tif
+*.tiff
+*.jp2
+*.j2k
+*.j2c
+*.img
+
+# Env / secrets
+.env
+.env.*
+
+# Cargo local overrides
+.cargo/config.toml.user
