@@ -20,7 +20,8 @@ use crate::open::open_geotiff;
 /// Strategies (in order):
 /// 1. **Identity remux** — copy every compressed tile block unchanged (COG→COG copy, identity bands)
 /// 2. **Planar band permute** — reorder separate band planes by copying their tile blocks (no decode)
-/// 3. **Tile-aligned crop remux** — copy a window of full tiles when offsets/sizes align to tile grid
+/// 3. **Hybrid crop remux** — copy full source tiles when possible; decode/recompress only
+///    edge tiles. Overview layers are cropped from source overviews (not resampled from base).
 pub fn try_remux_cog(
     input: &GeoTiffFile,
     output: &Path,
@@ -131,7 +132,7 @@ fn remux_planar_band_permute(
     Ok(true)
 }
 
-fn layer_ifd(input: &GeoTiffFile, layer_index: usize) -> Result<&Ifd> {
+pub(crate) fn layer_ifd(input: &GeoTiffFile, layer_index: usize) -> Result<&Ifd> {
     if layer_index == 0 {
         input
             .tiff()
@@ -179,23 +180,44 @@ fn try_remux_crop(
 ) -> Result<bool> {
     let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
     let tile_size = base_ifd.tile_width().unwrap_or(opts.blocksize) as usize;
+
+    if profile.sample.bits_per_sample == 8 && profile.sample.sample_format == SampleFormat::Uint {
+        let source_layers = collect_all_layers(input)?;
+        let output_layers = crate::hybrid_crop::build_hybrid_crop_layers_u8(
+            input,
+            &source_layers,
+            window,
+            profile,
+            opts,
+        )?;
+        remux_with_layers(profile, opts, output_layers, output)?;
+        return Ok(true);
+    }
+
     if !is_tile_aligned(window, tile_size) {
         return Ok(false);
     }
 
     let source_layers = collect_all_layers(input)?;
-    let levels = overview_levels(opts, input.width(), input.height());
+    let output_levels = overview_levels(opts, profile.width, profile.height);
 
-    let mut output_layers = Vec::with_capacity(source_layers.len());
-    for (layer_index, layer) in source_layers.iter().enumerate() {
-        let ifd = layer_ifd(input, layer_index)?;
-        let scale = if layer_index == 0 {
-            1
-        } else {
-            levels[layer_index - 1]
-        };
-        let crop = scale_window(window, scale);
-        output_layers.push(crop_layer_blocks(layer, ifd, &crop, tile_size)?);
+    let mut output_layers = Vec::with_capacity(1 + output_levels.len());
+    output_layers.push(crop_layer_blocks(
+        &source_layers[0],
+        layer_ifd(input, 0)?,
+        window,
+        tile_size,
+    )?);
+    for (ov_idx, &level) in output_levels.iter().enumerate() {
+        let source_idx = ov_idx + 1;
+        let ifd = layer_ifd(input, source_idx)?;
+        let crop = scale_window(window, level);
+        output_layers.push(crop_layer_blocks(
+            &source_layers[source_idx],
+            ifd,
+            &crop,
+            tile_size,
+        )?);
     }
 
     remux_with_layers(profile, opts, output_layers, output)?;

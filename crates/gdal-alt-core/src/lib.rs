@@ -6,6 +6,7 @@ pub mod input;
 pub mod jp2;
 pub mod open;
 pub mod progress;
+pub mod hybrid_crop;
 pub mod remux;
 pub mod util;
 pub mod validate;

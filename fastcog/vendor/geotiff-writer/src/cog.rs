@@ -2517,6 +2517,41 @@ pub struct RemuxCompressedBlock {
     pub sparse: bool,
 }
 
+/// Parameters for compressing one decoded tile during hybrid remux/crop.
+#[derive(Debug, Clone, Copy)]
+pub struct RemuxTileEncoding {
+    pub compression: Compression,
+    pub predictor: Predictor,
+    pub samples_per_pixel: u16,
+    pub tile_width: usize,
+    pub tile_height: u32,
+    pub deflate_level: u32,
+}
+
+/// Compress decoded tile samples into a remux-ready payload.
+pub fn remux_compress_tile<T: NumericSample>(
+    samples: &[T],
+    block_index: usize,
+    encoding: RemuxTileEncoding,
+) -> Result<RemuxCompressedBlock> {
+    let encoding_internal = CogBlockEncoding {
+        compression: encoding.compression,
+        predictor: encoding.predictor,
+        samples_per_pixel: encoding.samples_per_pixel,
+        row_width_pixels: encoding.tile_width,
+        block_height: encoding.tile_height,
+        lerc_options: None,
+        jpeg_options: None,
+        jpeg_sampling: None,
+        deflate_level: Some(encoding.deflate_level),
+    };
+    let payload = compress_cog_block(samples, block_index, encoding_internal)?;
+    Ok(RemuxCompressedBlock {
+        payload,
+        sparse: false,
+    })
+}
+
 impl CogBuilder {
     /// Write a COG by copying pre-compressed tile payloads (no decode/recompress).
     ///
