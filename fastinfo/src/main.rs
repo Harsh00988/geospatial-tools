@@ -16,8 +16,9 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let input = args.input.to_string_lossy();
     let started = std::time::Instant::now();
-    let info = gather(&args.input, args.mmap)?;
+    let info = gather(&input, args.mmap)?;
     print!("{}", format_text(&info));
     eprintln!(
         "fastinfo: read metadata in {:.3}s",

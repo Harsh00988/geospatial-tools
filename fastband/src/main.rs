@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use gdal_alt_core::{
-    convert_geotiff, CompressionChoice, ConvertRequest, CogOutputOptions, ResamplingChoice,
+    convert_geotiff, CompressionChoice, ConvertRequest, CogOutputOptions,
+    LercAdditionalCompressionChoice, ResamplingChoice,
 };
 use std::path::PathBuf;
 
@@ -50,12 +51,16 @@ enum CompressionArg {
     Deflate,
     Zstd,
     Jpeg,
+    Lerc,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ResamplingArg {
     Nearest,
     Average,
+    Bilinear,
+    Cubic,
+    Lanczos,
 }
 
 fn main() -> Result<()> {
@@ -63,12 +68,13 @@ fn main() -> Result<()> {
     let opts = cog_options(&args);
     opts.validate()?;
 
+    let input = args.input.to_string_lossy();
     let pool = gdal_alt_core::util::thread_pool(args.jobs)?;
     let started = std::time::Instant::now();
-    convert_geotiff(
+    let _result = convert_geotiff(
         &pool,
         &ConvertRequest {
-            input: &args.input,
+            input: &input,
             output: &args.output,
             opts: &opts,
             mmap: args.mmap,
@@ -94,13 +100,22 @@ fn cog_options(args: &Args) -> CogOutputOptions {
             CompressionArg::Deflate => CompressionChoice::Deflate,
             CompressionArg::Zstd => CompressionChoice::Zstd,
             CompressionArg::Jpeg => CompressionChoice::Jpeg,
+            CompressionArg::Lerc => CompressionChoice::Lerc,
         },
         deflate_level: args.deflate_level,
+        jpeg_quality: 75,
+        lerc_max_z_error: 0.0,
+        lerc_additional_compression: LercAdditionalCompressionChoice::None,
         resampling: match args.resampling {
             ResamplingArg::Nearest => ResamplingChoice::Nearest,
             ResamplingArg::Average => ResamplingChoice::Average,
+            ResamplingArg::Bilinear => ResamplingChoice::Bilinear,
+            ResamplingArg::Cubic => ResamplingChoice::Cubic,
+            ResamplingArg::Lanczos => ResamplingChoice::Lanczos,
         },
         overview_levels: args.overviews.clone(),
         no_overviews: args.no_overviews,
+        mask_from_alpha: true,
+        black_rgb_transparent: false,
     }
 }

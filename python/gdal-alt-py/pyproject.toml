@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "gdal-alt"
+version = "0.1.0"
+description = "Python bindings for the gdal-alternate pure-Rust raster toolkit"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "gdal_alt"

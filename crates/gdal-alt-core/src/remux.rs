@@ -17,6 +17,7 @@ use crate::cog::mask::prepare_remux_layers;
 use crate::crop::WriteWindow;
 use crate::input::RasterProfile;
 use crate::open::open_geotiff;
+use crate::path::ConvertPath;
 use crate::progress::{ProgressTracker, StageBar};
 use crate::util::ensure_parent_dir;
 
@@ -28,6 +29,7 @@ use crate::util::ensure_parent_dir;
 /// 3. **Hybrid crop remux** — copy full source tiles when possible; decode/recompress only
 ///    edge tiles. Overview layers are cropped from source overviews (not resampled from base).
 pub fn try_remux_cog(
+    pool: &rayon::ThreadPool,
     input: &GeoTiffFile,
     output: &Path,
     profile: &RasterProfile,
@@ -35,45 +37,77 @@ pub fn try_remux_cog(
     window: Option<&WriteWindow>,
     bands: Option<&[usize]>,
     show_progress: bool,
-) -> Result<bool> {
+) -> Result<Option<ConvertPath>> {
+    let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
+    if !base_ifd.is_tiled() {
+        return try_strip_to_tiled_remux(
+            pool, input, output, profile, opts, window, bands, show_progress,
+        );
+    }
+
     if !layout_compatible(input, profile, opts)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     if let Some(window) = window {
-        return try_remux_crop(input, output, profile, opts, window, show_progress);
+        if try_remux_crop(input, output, profile, opts, window, show_progress)? {
+            return Ok(Some(ConvertPath::HybridCropRemux));
+        }
+        return Ok(None);
     }
 
     if let Some(bands) = bands {
         if is_identity_bands(bands, input.band_count() as usize) {
             if compression_matches(opts, input_compression(input.tiff().ifd(input.base_ifd_index())?)) {
                 if overview_tiles_compatible(input, opts.blocksize)? {
-                    return remux_identity(input, output, profile, opts, show_progress);
+                    remux_identity(input, output, profile, opts, show_progress)?;
+                    return Ok(Some(ConvertPath::RemuxIdentity));
                 }
                 if input.overview_count() > 0 {
-                    return try_transcode_remux(input, output, profile, opts, show_progress);
+                    if try_transcode_remux(input, output, profile, opts, show_progress)? {
+                        return Ok(Some(ConvertPath::TranscodeRemux));
+                    }
+                    remux_identity(input, output, profile, opts, show_progress)?;
+                    return Ok(Some(ConvertPath::RemuxIdentity));
                 }
-                return remux_identity(input, output, profile, opts, show_progress);
+                remux_identity(input, output, profile, opts, show_progress)?;
+                return Ok(Some(ConvertPath::RemuxIdentity));
             }
-            return try_transcode_remux(input, output, profile, opts, show_progress);
+            if try_transcode_remux(input, output, profile, opts, show_progress)? {
+                return Ok(Some(ConvertPath::TranscodeRemux));
+            }
+            return Ok(None);
         }
         if ifd_planar(input.tiff().ifd(input.base_ifd_index())?) == PlanarConfiguration::Planar {
-            return remux_planar_band_permute(input, output, profile, opts, bands, show_progress);
+            remux_planar_band_permute(input, output, profile, opts, bands, show_progress)?;
+            return Ok(Some(ConvertPath::PlanarBandPermute));
         }
-        return remux_chunky_band_permute(input, output, profile, opts, bands, show_progress);
+        if remux_chunky_band_permute(input, output, profile, opts, bands, show_progress)? {
+            return Ok(Some(ConvertPath::ChunkyBandPermute));
+        }
+        return Ok(None);
     }
 
     if compression_matches(opts, input_compression(input.tiff().ifd(input.base_ifd_index())?)) {
         if overview_tiles_compatible(input, opts.blocksize)? {
-            return remux_identity(input, output, profile, opts, show_progress);
+            remux_identity(input, output, profile, opts, show_progress)?;
+            return Ok(Some(ConvertPath::RemuxIdentity));
         }
         if input.overview_count() > 0 {
-            return try_transcode_remux(input, output, profile, opts, show_progress);
+            if try_transcode_remux(input, output, profile, opts, show_progress)? {
+                return Ok(Some(ConvertPath::TranscodeRemux));
+            }
+            remux_identity(input, output, profile, opts, show_progress)?;
+            return Ok(Some(ConvertPath::RemuxIdentity));
         }
-        return remux_identity(input, output, profile, opts, show_progress);
+        remux_identity(input, output, profile, opts, show_progress)?;
+        return Ok(Some(ConvertPath::RemuxIdentity));
     }
 
-    try_transcode_remux(input, output, profile, opts, show_progress)
+    if try_transcode_remux(input, output, profile, opts, show_progress)? {
+        return Ok(Some(ConvertPath::TranscodeRemux));
+    }
+    Ok(None)
 }
 
 fn layout_compatible(
@@ -82,10 +116,6 @@ fn layout_compatible(
     opts: &CogOutputOptions,
 ) -> Result<bool> {
     let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
-    if !base_ifd.is_tiled() {
-        return Ok(false);
-    }
-
     let (tile_w, tile_h) = match (base_ifd.tile_width(), base_ifd.tile_height()) {
         (Some(w), Some(h)) => (w, h),
         _ => return Ok(false),
@@ -109,6 +139,147 @@ fn layout_compatible(
     }
 
     Ok(true)
+}
+
+fn try_strip_to_tiled_remux(
+    pool: &rayon::ThreadPool,
+    input: &GeoTiffFile,
+    output: &Path,
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+    window: Option<&WriteWindow>,
+    bands: Option<&[usize]>,
+    show_progress: bool,
+) -> Result<Option<ConvertPath>> {
+    if bands.is_some_and(|bands| !is_identity_bands(bands, input.band_count() as usize)) {
+        return Ok(None);
+    }
+
+    let window_owned = window.cloned();
+    match (profile.sample.bits_per_sample, profile.sample.sample_format) {
+        (8, SampleFormat::Uint) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<u8>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (8, SampleFormat::Int) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<i8>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (16, SampleFormat::Uint) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<u16>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (16, SampleFormat::Int) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<i16>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (32, SampleFormat::Uint) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<u32>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (32, SampleFormat::Int) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<i32>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (32, SampleFormat::Float) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<f32>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (64, SampleFormat::Uint) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<u64>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (64, SampleFormat::Int) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<i64>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        (64, SampleFormat::Float) => {
+            crate::strip_encode::convert_strip_to_remux_cog::<f64>(
+                pool,
+                input,
+                output,
+                profile,
+                opts,
+                window_owned,
+                bands,
+                show_progress,
+            )?;
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(ConvertPath::StripEncode))
 }
 
 fn try_transcode_remux(
@@ -162,12 +333,13 @@ fn try_transcode_remux(
     transcode_bar.inc(1);
     transcode_bar.done("done");
 
-    remux_encoded_layers(
+    remux_with_layers(
         input,
         profile,
         opts,
         output_layers,
         output,
+        None,
         Some(levels),
         Some(input_overview_layer_sizes(input)?),
         show_progress,
@@ -246,7 +418,7 @@ fn remux_identity(
     profile: &RasterProfile,
     opts: &CogOutputOptions,
     show_progress: bool,
-) -> Result<bool> {
+) -> Result<()> {
     let progress = ProgressTracker::new(show_progress);
     let read_bar = progress.stage("Remux read", (1 + input.overview_count()) as u64);
     let layers = collect_all_layers(input, Some(&read_bar))?;
@@ -259,12 +431,13 @@ fn remux_identity(
         opts,
         layers,
         output,
+        None,
         Some(levels),
         Some(sizes),
         show_progress,
     )?;
     progress.finish();
-    Ok(true)
+    Ok(())
 }
 
 fn remux_planar_band_permute(
@@ -274,7 +447,7 @@ fn remux_planar_band_permute(
     opts: &CogOutputOptions,
     bands: &[usize],
     show_progress: bool,
-) -> Result<bool> {
+) -> Result<()> {
     let progress = ProgressTracker::new(show_progress);
     let read_bar = progress.stage("Remux read", (1 + input.overview_count()) as u64);
     let source_layers = collect_all_layers(input, Some(&read_bar))?;
@@ -292,12 +465,13 @@ fn remux_planar_band_permute(
         opts,
         output_layers,
         output,
+        None,
         Some(input_overview_levels(input)?),
         Some(input_overview_layer_sizes(input)?),
         show_progress,
     )?;
     progress.finish();
-    Ok(true)
+    Ok(())
 }
 
 pub(crate) fn layer_ifd(input: &GeoTiffFile, layer_index: usize) -> Result<&Ifd> {
@@ -392,6 +566,7 @@ fn try_remux_crop(
         opts,
         output_layers,
         output,
+        Some(window),
         Some(output_levels),
         None,
         show_progress,
@@ -451,6 +626,7 @@ fn remux_chunky_band_permute(
         opts,
         output_layers,
         output,
+        None,
         Some(input_overview_levels(input)?),
         Some(input_overview_layer_sizes(input)?),
         show_progress,
@@ -487,6 +663,7 @@ fn remux_with_layers(
     opts: &CogOutputOptions,
     layers: Vec<Vec<RemuxCompressedBlock>>,
     output: &Path,
+    window: Option<&WriteWindow>,
     overview_levels: Option<Vec<u32>>,
     overview_sizes: Option<Vec<(u32, u32)>>,
     show_progress: bool,
@@ -497,6 +674,7 @@ fn remux_with_layers(
         opts,
         layers,
         output,
+        window,
         overview_levels,
         overview_sizes,
         show_progress,
@@ -509,16 +687,12 @@ pub(crate) fn remux_encoded_layers(
     opts: &CogOutputOptions,
     layers: Vec<Vec<RemuxCompressedBlock>>,
     output: &Path,
+    window: Option<&WriteWindow>,
     mut overview_levels: Option<Vec<u32>>,
     mut overview_sizes: Option<Vec<(u32, u32)>>,
     show_progress: bool,
 ) -> Result<()> {
-    let (remux_layers, has_masks) = prepare_remux_layers(input, layers)?;
-    let target_overviews = remux_layers
-        .iter()
-        .filter(|layer| matches!(layer, geotiff_writer::RemuxLayer::Rgb(_)))
-        .count()
-        .saturating_sub(1);
+    let target_overviews = layers.len().saturating_sub(1);
     if let Some(levels) = overview_levels.as_mut() {
         levels.truncate(target_overviews);
     }
@@ -533,6 +707,18 @@ pub(crate) fn remux_encoded_layers(
                 .collect(),
         );
     }
+
+    let levels_slice = overview_levels.as_deref().unwrap_or(&[]);
+    let (remux_layers, has_masks) = prepare_remux_layers(
+        input,
+        profile,
+        layers,
+        window,
+        profile.width,
+        profile.height,
+        levels_slice,
+        opts,
+    )?;
 
     let cog = match (overview_levels, overview_sizes, has_masks) {
         (Some(levels), Some(sizes), true) => configure_cog_with_layer_sizes_masked(
@@ -579,6 +765,7 @@ pub(crate) fn remux_encoded_layers(
 }
 
 pub fn remux_if_possible(
+    pool: &rayon::ThreadPool,
     input_path: &Path,
     output: &Path,
     profile: &RasterProfile,
@@ -587,10 +774,11 @@ pub fn remux_if_possible(
     bands: Option<&[usize]>,
     mmap: bool,
     show_progress: bool,
-) -> Result<bool> {
+) -> Result<Option<ConvertPath>> {
     ensure_parent_dir(output)?;
     let input = open_geotiff(input_path, mmap)?;
     try_remux_cog(
+        pool,
         &input,
         output,
         profile,

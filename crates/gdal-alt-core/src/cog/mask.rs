@@ -1,10 +1,19 @@
 use anyhow::{bail, Result};
 use geotiff_reader::GeoTiffFile;
-use geotiff_writer::{RemuxCompressedBlock, RemuxLayer, RemuxMaskDescriptor};
-use tiff_core::{TAG_NEW_SUBFILE_TYPE, TAG_SUBFILE_TYPE};
+use geotiff_writer::{remux_compress_tile, RemuxCompressedBlock, RemuxLayer, RemuxMaskDescriptor, RemuxTileEncoding};
+use ndarray::{Array2, Array3};
+use rayon::prelude::*;
+use tiff_core::{Predictor, TAG_NEW_SUBFILE_TYPE, TAG_SUBFILE_TYPE};
 use tiff_reader::{Ifd, TagValue};
 
+use super::options::CogOutputOptions;
+use super::semantics::{
+    associated_alpha_band_index, detect_transparency, TransparencySource,
+};
 use super::tile_payload::{input_compression, read_layer_blocks};
+use crate::cog::{tile_jobs, TileJob};
+use crate::crop::{scale_window, WriteWindow};
+use crate::input::RasterProfile;
 
 const MASK_FLAG: u64 = 0x4;
 const REDUCED_RESOLUTION_FLAG: u64 = 0x1;
@@ -140,18 +149,252 @@ pub fn interleave_rgb_and_mask_layers(
 
 pub fn prepare_remux_layers(
     input: &GeoTiffFile,
+    profile: &RasterProfile,
     rgb_layers: Vec<Vec<RemuxCompressedBlock>>,
+    window: Option<&WriteWindow>,
+    out_width: u32,
+    out_height: u32,
+    overview_levels: &[u32],
+    opts: &CogOutputOptions,
 ) -> Result<(Vec<RemuxLayer>, bool)> {
-    let Some(masks) = discover_dataset_masks(input) else {
-        return Ok((
-            rgb_layers.into_iter().map(RemuxLayer::rgb).collect(),
-            false,
-        ));
+    if let Some(masks) = discover_dataset_masks(input) {
+        let (mask_blocks, mask_descriptors) = if let Some(window) = window {
+            build_cropped_mask_layers(
+                input,
+                &masks,
+                window,
+                out_width,
+                out_height,
+                overview_levels,
+                opts,
+            )?
+        } else {
+            let blocks = collect_mask_remux_layers(input, &masks)?;
+            let descriptors = mask_layer_descriptors(input, &masks)?;
+            align_masks_to_rgb_layers(blocks, &descriptors, rgb_layers.len())?
+        };
+        let layers = interleave_rgb_and_mask_layers(rgb_layers, mask_blocks, mask_descriptors)?;
+        return Ok((layers, true));
+    }
+
+    let transparency = detect_transparency(
+        input,
+        profile,
+        opts.mask_from_alpha,
+        opts.black_rgb_transparent,
+    );
+    if matches!(
+        transparency,
+        TransparencySource::AssociatedAlpha | TransparencySource::BlackRgb
+    ) {
+        if let Some((mask_blocks, mask_descriptors)) = build_synthesized_mask_layers(
+            input,
+            profile,
+            transparency,
+            window,
+            out_width,
+            out_height,
+            overview_levels,
+            opts,
+        )? {
+            let layers =
+                interleave_rgb_and_mask_layers(rgb_layers, mask_blocks, mask_descriptors)?;
+            return Ok((layers, true));
+        }
+    }
+
+    Ok((
+        rgb_layers.into_iter().map(RemuxLayer::rgb).collect(),
+        false,
+    ))
+}
+
+/// When RGB overview count differs from source mask overview count, keep masks that
+/// match the output RGB layer dimensions.
+fn align_masks_to_rgb_layers(
+    mask_blocks: Vec<Vec<RemuxCompressedBlock>>,
+    mask_descriptors: &[RemuxMaskDescriptor],
+    rgb_layer_count: usize,
+) -> Result<(Vec<Vec<RemuxCompressedBlock>>, Vec<RemuxMaskDescriptor>)> {
+    if mask_blocks.len() != mask_descriptors.len() {
+        bail!("mask block/descriptor count mismatch");
+    }
+    let expected_masks = if rgb_layer_count == 0 {
+        0
+    } else {
+        1 + rgb_layer_count - 1
     };
-    let mask_blocks = collect_mask_remux_layers(input, &masks)?;
-    let mask_descriptors = mask_layer_descriptors(input, &masks)?;
-    let layers = interleave_rgb_and_mask_layers(rgb_layers, mask_blocks, mask_descriptors)?;
-    Ok((layers, true))
+    if mask_blocks.len() < expected_masks {
+        bail!(
+            "source has {} mask layers but output needs {}",
+            mask_blocks.len(),
+            expected_masks
+        );
+    }
+    if mask_blocks.len() == expected_masks {
+        return Ok((mask_blocks, mask_descriptors.to_vec()));
+    }
+    Ok((
+        mask_blocks.into_iter().take(expected_masks).collect(),
+        mask_descriptors.iter().take(expected_masks).cloned().collect(),
+    ))
+}
+
+pub fn build_cropped_mask_layers(
+    input: &GeoTiffFile,
+    masks: &DatasetMasks,
+    window: &WriteWindow,
+    out_width: u32,
+    out_height: u32,
+    output_levels: &[u32],
+    opts: &CogOutputOptions,
+) -> Result<(Vec<Vec<RemuxCompressedBlock>>, Vec<RemuxMaskDescriptor>)> {
+    let tiff = input.tiff();
+    let tile_size = opts.blocksize as usize;
+    let encoding = mask_tile_encoding(opts, tile_size);
+
+    let base_ifd = tiff.ifd(masks.base_ifd_index)?;
+    let base_blocks = encode_cropped_mask_layer(
+        tiff,
+        base_ifd,
+        window,
+        out_width,
+        out_height,
+        tile_size,
+        encoding,
+    )?;
+    let base_descriptor = cropped_mask_descriptor(
+        base_ifd,
+        out_width,
+        out_height,
+        tile_size,
+        opts.blocksize,
+        false,
+    );
+
+    let mut blocks = vec![base_blocks];
+    let mut descriptors = vec![base_descriptor];
+
+    for (index, &level) in output_levels.iter().enumerate() {
+        let ifd_index = masks
+            .overview_ifd_indices
+            .get(index)
+            .copied()
+            .unwrap_or(masks.base_ifd_index);
+        let ifd = tiff.ifd(ifd_index)?;
+        let scaled = scale_window(window, level);
+        let layer_w = (out_width / level).max(1);
+        let layer_h = (out_height / level).max(1);
+        let layer_tile = if index < masks.overview_ifd_indices.len() {
+            ifd.tile_width().unwrap_or(opts.blocksize)
+        } else {
+            opts.blocksize
+        };
+        let layer_tile_size = layer_tile as usize;
+        let layer_encoding = mask_tile_encoding(opts, layer_tile_size);
+        blocks.push(encode_cropped_mask_layer(
+            tiff,
+            ifd,
+            &scaled,
+            layer_w,
+            layer_h,
+            layer_tile_size,
+            layer_encoding,
+        )?);
+        descriptors.push(cropped_mask_descriptor(
+            ifd,
+            layer_w,
+            layer_h,
+            layer_tile_size,
+            layer_tile,
+            true,
+        ));
+    }
+
+    Ok((blocks, descriptors))
+}
+
+fn encode_cropped_mask_layer(
+    tiff: &tiff_reader::TiffFile,
+    ifd: &Ifd,
+    src_win: &WriteWindow,
+    out_width: u32,
+    out_height: u32,
+    tile_size: usize,
+    encoding: RemuxTileEncoding,
+) -> Result<Vec<RemuxCompressedBlock>> {
+    let jobs = tile_jobs(out_width, out_height, tile_size as u32);
+    let mut blocks = jobs
+        .par_iter()
+        .enumerate()
+        .map(|(block_index, job)| {
+            let tile = read_mask_tile(tiff, ifd, src_win, job)?;
+            let padded = pad_mask_tile(&tile, job.rows, job.cols, tile_size);
+            let block = remux_compress_tile(&padded, block_index, encoding)
+                .map_err(|err| anyhow::anyhow!(err))?;
+            Ok((block_index, block))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    blocks.sort_by_key(|(index, _)| *index);
+    Ok(blocks.into_iter().map(|(_, block)| block).collect())
+}
+
+fn read_mask_tile(
+    tiff: &tiff_reader::TiffFile,
+    ifd: &Ifd,
+    src_win: &WriteWindow,
+    job: &TileJob,
+) -> Result<Vec<u8>> {
+    let src_col = src_win.col_off + job.col_off;
+    let src_row = src_win.row_off + job.row_off;
+    let data = tiff.read_window_from_ifd::<u8>(ifd, src_row, src_col, job.rows, job.cols)?;
+    let array = data
+        .into_dimensionality::<ndarray::Ix2>()
+        .map_err(|err| anyhow::anyhow!("mask window must be 2D: {err}"))?;
+    Ok(binarize_mask_array(&array))
+}
+
+fn binarize_mask_array(array: &Array2<u8>) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| if value != 0 { 255 } else { 0 })
+        .collect()
+}
+
+fn pad_mask_tile(samples: &[u8], rows: usize, cols: usize, tile_size: usize) -> Vec<u8> {
+    if rows == tile_size && cols == tile_size {
+        return samples.to_vec();
+    }
+    let mut padded = vec![0u8; tile_size * tile_size];
+    for row in 0..rows {
+        let src_start = row * cols;
+        let dst_start = row * tile_size;
+        padded[dst_start..dst_start + cols].copy_from_slice(&samples[src_start..src_start + cols]);
+    }
+    padded
+}
+
+fn mask_tile_encoding(opts: &CogOutputOptions, tile_size: usize) -> RemuxTileEncoding {
+    crate::cog::tile_encoding_from_opts(opts, tile_size, 1, Some(Predictor::None))
+}
+
+fn cropped_mask_descriptor(
+    source_ifd: &Ifd,
+    width: u32,
+    height: u32,
+    _tile_size: usize,
+    tile_u32: u32,
+    overview: bool,
+) -> RemuxMaskDescriptor {
+    RemuxMaskDescriptor {
+        width,
+        height,
+        tile_width: tile_u32,
+        tile_height: tile_u32,
+        bits_per_sample: 8,
+        compression: input_compression(source_ifd),
+        overview,
+    }
 }
 
 fn mask_descriptor_from_ifd(ifd: &Ifd, overview: bool) -> Result<RemuxMaskDescriptor> {
@@ -164,9 +407,279 @@ fn mask_descriptor_from_ifd(ifd: &Ifd, overview: bool) -> Result<RemuxMaskDescri
         height: ifd.height(),
         tile_width: tile_w,
         tile_height: tile_h,
+        bits_per_sample: ifd.bits_per_sample().unwrap_or_else(|_| vec![1]).first().copied().unwrap_or(1),
         compression: input_compression(ifd),
         overview,
     })
+}
+
+fn build_synthesized_mask_layers(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    source: TransparencySource,
+    window: Option<&WriteWindow>,
+    out_width: u32,
+    out_height: u32,
+    overview_levels: &[u32],
+    opts: &CogOutputOptions,
+) -> Result<Option<(Vec<Vec<RemuxCompressedBlock>>, Vec<RemuxMaskDescriptor>)>> {
+    let tile_size = opts.blocksize as usize;
+    let encoding = mask_tile_encoding(opts, tile_size);
+    let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
+
+    let base_blocks = encode_synthesized_mask_layer(
+        input,
+        profile,
+        source,
+        window,
+        out_width,
+        out_height,
+        tile_size,
+        encoding,
+    )?;
+    let mut blocks = vec![base_blocks];
+    let mut descriptors = vec![synthesized_mask_descriptor(
+        out_width,
+        out_height,
+        opts.blocksize,
+        false,
+        base_ifd,
+    )];
+
+    for (index, &level) in overview_levels.iter().enumerate() {
+        let scaled = window.map(|w| scale_window(w, level));
+        let layer_w = (out_width / level).max(1);
+        let layer_h = (out_height / level).max(1);
+        blocks.push(encode_synthesized_mask_layer(
+            input,
+            profile,
+            source,
+            scaled.as_ref(),
+            layer_w,
+            layer_h,
+            tile_size,
+            encoding,
+        )?);
+        descriptors.push(synthesized_mask_descriptor(
+            layer_w,
+            layer_h,
+            opts.blocksize,
+            true,
+            base_ifd,
+        ));
+        let _ = index;
+    }
+
+    Ok(Some((blocks, descriptors)))
+}
+
+fn synthesized_mask_descriptor(
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    overview: bool,
+    source_ifd: &Ifd,
+) -> RemuxMaskDescriptor {
+    RemuxMaskDescriptor {
+        width,
+        height,
+        tile_width: tile_size,
+        tile_height: tile_size,
+        bits_per_sample: 8,
+        compression: input_compression(source_ifd),
+        overview,
+    }
+}
+
+fn encode_synthesized_mask_layer(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    source: TransparencySource,
+    window: Option<&WriteWindow>,
+    out_width: u32,
+    out_height: u32,
+    tile_size: usize,
+    encoding: RemuxTileEncoding,
+) -> Result<Vec<RemuxCompressedBlock>> {
+    let jobs = tile_jobs(out_width, out_height, tile_size as u32);
+    let mut blocks = jobs
+        .par_iter()
+        .enumerate()
+        .map(|(block_index, job)| {
+            let tile = read_synthesized_mask_tile(input, profile, source, window, job)?;
+            let padded = pad_mask_tile(&tile, job.rows, job.cols, tile_size);
+            let block = remux_compress_tile(&padded, block_index, encoding)
+                .map_err(|err| anyhow::anyhow!(err))?;
+            Ok((block_index, block))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    blocks.sort_by_key(|(index, _)| *index);
+    Ok(blocks.into_iter().map(|(_, block)| block).collect())
+}
+
+fn read_synthesized_mask_tile(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    source: TransparencySource,
+    window: Option<&WriteWindow>,
+    job: &TileJob,
+) -> Result<Vec<u8>> {
+    let src_col = window.map(|w| w.col_off + job.col_off).unwrap_or(job.col_off);
+    let src_row = window.map(|w| w.row_off + job.row_off).unwrap_or(job.row_off);
+
+    match source {
+        TransparencySource::AssociatedAlpha => {
+            let band = associated_alpha_band_index(profile)
+                .ok_or_else(|| anyhow::anyhow!("missing associated alpha band"))?;
+            let band_index = band - 1;
+            if profile.sample.bits_per_sample <= 8 {
+                let data = input.read_band_window::<u8>(
+                    band_index,
+                    src_row,
+                    src_col,
+                    job.rows,
+                    job.cols,
+                )?;
+                let array = data
+                    .into_dimensionality::<ndarray::Ix2>()
+                    .map_err(|err| anyhow::anyhow!("alpha window must be 2D: {err}"))?;
+                Ok(alpha_to_mask_array(&array))
+            } else {
+                let data = input.read_band_window::<u16>(
+                    band_index,
+                    src_row,
+                    src_col,
+                    job.rows,
+                    job.cols,
+                )?;
+                let array = data
+                    .into_dimensionality::<ndarray::Ix2>()
+                    .map_err(|err| anyhow::anyhow!("alpha window must be 2D: {err}"))?;
+                Ok(alpha_u16_to_mask_array(&array))
+            }
+        }
+        TransparencySource::BlackRgb => {
+            let data = input.read_window::<u8>(src_row, src_col, job.rows, job.cols)?;
+            let array = data
+                .into_dimensionality::<ndarray::Ix3>()
+                .map_err(|err| anyhow::anyhow!("RGB window must be 3D: {err}"))?;
+            Ok(black_rgb_to_mask_array(&array))
+        }
+        _ => bail!("unsupported synthesized mask source"),
+    }
+}
+
+fn alpha_to_mask_array(array: &Array2<u8>) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| if value > 0 { 255 } else { 0 })
+        .collect()
+}
+
+fn alpha_u16_to_mask_array(array: &Array2<u16>) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| if value > 0 { 255 } else { 0 })
+        .collect()
+}
+
+fn black_rgb_to_mask_array(array: &Array3<u8>) -> Vec<u8> {
+    let rows = array.shape()[0];
+    let cols = array.shape()[1];
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        for col in 0..cols {
+            let valid = !(array[[row, col, 0]] == 0
+                && array[[row, col, 1]] == 0
+                && array[[row, col, 2]] == 0);
+            out.push(if valid { 255 } else { 0 });
+        }
+    }
+    out
+}
+
+pub fn validate_dataset_masks(input: &GeoTiffFile, issues: &mut Vec<crate::validate::ValidationIssue>) {
+    use crate::validate::{issue, ValidationLevel};
+
+    let tiff = input.tiff();
+    let base = match tiff.ifd(input.base_ifd_index()) {
+        Ok(ifd) => ifd,
+        Err(err) => {
+            issues.push(issue(
+                ValidationLevel::Error,
+                format!("failed to read base IFD for mask validation: {err}"),
+            ));
+            return;
+        }
+    };
+
+    let mut base_mask = None;
+    let mut overview_masks = Vec::new();
+    for (index, ifd) in tiff.ifds().iter().enumerate() {
+        if index == input.base_ifd_index() || !is_transparency_mask_ifd(ifd) {
+            continue;
+        }
+        if has_reduced_resolution(ifd) {
+            overview_masks.push((index, ifd.width(), ifd.height()));
+        } else if ifd.width() == base.width() && ifd.height() == base.height() {
+            if base_mask.is_some() {
+                issues.push(issue(
+                    ValidationLevel::Error,
+                    "multiple full-resolution transparency mask IFDs found",
+                ));
+            }
+            base_mask = Some(index);
+        }
+    }
+
+    let Some(base_mask_index) = base_mask else {
+        return;
+    };
+
+    let base_mask_ifd = &tiff.ifds()[base_mask_index];
+    if !base_mask_ifd.is_tiled() {
+        issues.push(issue(
+            ValidationLevel::Error,
+            "dataset transparency mask must be tiled",
+        ));
+    }
+
+    if input.overview_count() > 0 && overview_masks.len() != input.overview_count() {
+        issues.push(issue(
+            ValidationLevel::Warning,
+            format!(
+                "found {} mask overview IFDs but {} RGB overview IFDs",
+                overview_masks.len(),
+                input.overview_count()
+            ),
+        ));
+    }
+
+    for index in 0..input.overview_count() {
+        let rgb = match input.overview_ifd(index) {
+            Ok(ifd) => ifd,
+            Err(err) => {
+                issues.push(issue(
+                    ValidationLevel::Warning,
+                    format!("overview {index} unavailable during mask validation: {err}"),
+                ));
+                continue;
+            }
+        };
+        if !overview_masks
+            .iter()
+            .any(|(_, w, h)| *w == rgb.width() && *h == rgb.height())
+        {
+            issues.push(issue(
+                ValidationLevel::Warning,
+                format!(
+                    "no mask overview matches RGB overview {index} ({}x{})",
+                    rgb.width(),
+                    rgb.height()
+                ),
+            ));
+        }
+    }
 }
 
 fn is_transparency_mask_ifd(ifd: &Ifd) -> bool {

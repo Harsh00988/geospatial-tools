@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use geotiff_reader::GeoTiffFile;
 use tiff_core::Compression;
 
+use crate::cog::mask::validate_dataset_masks;
 use crate::open::open_geotiff;
 
 #[derive(Debug, Clone)]
@@ -141,6 +142,24 @@ pub fn validate_geotiff(input: &GeoTiffFile, path: &Path) -> ValidationReport {
         prev_h = h;
     }
 
+    validate_dataset_masks(input, &mut issues);
+
+    if let Ok(source) = std::fs::read(path) {
+        if !source.windows(4).any(|window| {
+            window.starts_with(b"GDAL_STRUCTURAL_METADATA_SIZE=")
+                || source
+                    .get(8..)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(|text| text.contains("GDAL_STRUCTURAL_METADATA_SIZE="))
+                    .unwrap_or(false)
+        }) {
+            issues.push(issue(
+                ValidationLevel::Warning,
+                "missing GDAL COG structural metadata ghost area",
+            ));
+        }
+    }
+
     ValidationReport {
         path: path.display().to_string(),
         issues,
@@ -169,7 +188,7 @@ pub fn format_report(report: &ValidationReport) -> String {
     out
 }
 
-fn issue(level: ValidationLevel, message: impl Into<String>) -> ValidationIssue {
+pub(crate) fn issue(level: ValidationLevel, message: impl Into<String>) -> ValidationIssue {
     ValidationIssue {
         level,
         message: message.into(),
@@ -185,6 +204,7 @@ fn is_web_friendly_compression(code: u16) -> bool {
                 | Compression::Deflate
                 | Compression::Jpeg
                 | Compression::Zstd
+                | Compression::Lerc
         )
     )
 }

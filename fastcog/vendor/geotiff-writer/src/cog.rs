@@ -34,6 +34,9 @@ use crate::sample::{parse_nodata_value, NumericSample};
 pub enum Resampling {
     NearestNeighbor,
     Average,
+    Bilinear,
+    Cubic,
+    Lanczos,
 }
 
 /// How COG overview IFDs are referenced from the TIFF metadata.
@@ -178,7 +181,7 @@ fn build_mask_image_tags(mask: &RemuxMaskDescriptor, is_bigtiff: bool) -> Result
         width: mask.width,
         height: mask.height,
         samples_per_pixel: 1,
-        bits_per_sample: 1,
+        bits_per_sample: mask.bits_per_sample,
         sample_format: 1,
         compression: mask.compression.to_code(),
         photometric: 4,
@@ -1373,7 +1376,8 @@ impl CogBuilder {
 
         let tw = self.inner.tile_width.unwrap_or(256) as usize;
         let th = self.inner.tile_height.unwrap_or(256) as usize;
-        self.inner.validate_3d_data_shape(height, width, 3)?;
+        let bands = self.inner.bands as usize;
+        self.inner.validate_3d_data_shape(height, width, bands)?;
         self.validate_images::<T>(&overview_levels, tw as u32, th as u32)?;
 
         for (idx, &level) in overview_levels.iter().enumerate() {
@@ -1402,9 +1406,9 @@ impl CogBuilder {
             sparse: self.inner.sparse,
         };
 
-        let mut layer_block_counts = vec![planar_block_count(width, height, tw, th, 3)];
+        let mut layer_block_counts = vec![planar_block_count(width, height, tw, th, bands)];
         for &(ow, oh) in overview_sizes {
-            layer_block_counts.push(planar_block_count(ow, oh, tw, th, 3));
+            layer_block_counts.push(planar_block_count(ow, oh, tw, th, bands));
         }
         let committed = vec![false; layer_block_counts.len()];
 
@@ -1627,9 +1631,9 @@ impl<W: Write + Seek> PlanarCogStream<W> {
     }
 }
 
-/// Pack one single-band u8 tile block for a planar COG layer.
-pub fn pack_u8_planar_tile(
-    samples: &[u8],
+/// Pack one single-band tile block for a planar COG layer.
+pub fn pack_planar_tile<T: NumericSample>(
+    samples: &[T],
     block_index: usize,
     plan: LayerEncodePlan,
 ) -> Result<PackedPlanarTile> {
@@ -1652,6 +1656,24 @@ pub fn pack_u8_planar_tile(
         trailer: packed.trailer,
         sparse: packed.sparse,
     })
+}
+
+/// Pack one single-band u8 tile block for a planar COG layer.
+pub fn pack_u8_planar_tile(
+    samples: &[u8],
+    block_index: usize,
+    plan: LayerEncodePlan,
+) -> Result<PackedPlanarTile> {
+    pack_planar_tile(samples, block_index, plan)
+}
+
+/// Pack one single-band u16 tile block for a planar COG layer.
+pub fn pack_u16_planar_tile(
+    samples: &[u16],
+    block_index: usize,
+    plan: LayerEncodePlan,
+) -> Result<PackedPlanarTile> {
+    pack_planar_tile(samples, block_index, plan)
 }
 
 fn planar_block_count(width: usize, height: usize, tw: usize, th: usize, bands: usize) -> usize {
@@ -2034,7 +2056,7 @@ where
                 }
             }
         }
-        Resampling::Average => {
+        Resampling::Average | Resampling::Bilinear | Resampling::Cubic | Resampling::Lanczos => {
             let mut sums = vec![0f64; out_cols];
             let mut counts = vec![0usize; out_cols];
             for row in 0..out_rows {
@@ -2456,9 +2478,9 @@ fn spool_tiled_data_3d<T: NumericSample + Send + Sync>(
     Ok(blocks)
 }
 
-/// Pack every tile block for a planar u8 layer without writing to a COG spool.
-pub fn collect_planar_packed_u8(
-    planes: [&[u8]; 3],
+/// Pack every tile block for a planar layer without writing to a COG spool.
+pub fn collect_planar_packed<T: NumericSample + Send + Sync>(
+    planes: &[&[T]],
     width: usize,
     height: usize,
     plan: LayerEncodePlan,
@@ -2468,11 +2490,10 @@ pub fn collect_planar_packed_u8(
     let tiles_across = width.div_ceil(tw);
     let tiles_down = height.div_ceil(th);
     let tiles_per_plane = tiles_across * tiles_down;
-    let fill_value = 0u8;
+    let fill_value = T::zero();
 
-    let mut pending = Vec::with_capacity(tiles_per_plane * 3);
-    for band in 0..3 {
-        let plane = planes[band];
+    let mut pending = Vec::with_capacity(tiles_per_plane * planes.len());
+    for (band, plane) in planes.iter().enumerate() {
         for tile_row in 0..tiles_down {
             for tile_col in 0..tiles_across {
                 let tile_index = tile_row * tiles_across + tile_col;
@@ -2493,8 +2514,28 @@ pub fn collect_planar_packed_u8(
 
     pending
         .into_par_iter()
-        .map(|(block_index, tile_data)| pack_u8_planar_tile(&tile_data, block_index, plan))
+        .map(|(block_index, tile_data)| pack_planar_tile(&tile_data, block_index, plan))
         .collect()
+}
+
+/// Pack every tile block for a planar u8 layer without writing to a COG spool.
+pub fn collect_planar_packed_u8(
+    planes: [&[u8]; 3],
+    width: usize,
+    height: usize,
+    plan: LayerEncodePlan,
+) -> Result<Vec<PackedPlanarTile>> {
+    collect_planar_packed(&planes, width, height, plan)
+}
+
+/// Pack every tile block for a planar u16 layer without writing to a COG spool.
+pub fn collect_planar_packed_u16(
+    planes: &[&[u16]],
+    width: usize,
+    height: usize,
+    plan: LayerEncodePlan,
+) -> Result<Vec<PackedPlanarTile>> {
+    collect_planar_packed(planes, width, height, plan)
 }
 
 fn spool_planar_data<T: NumericSample + Send + Sync>(
@@ -2669,6 +2710,7 @@ pub struct RemuxMaskDescriptor {
     pub height: u32,
     pub tile_width: u32,
     pub tile_height: u32,
+    pub bits_per_sample: u16,
     pub compression: Compression,
     pub overview: bool,
 }
@@ -2705,6 +2747,8 @@ pub struct RemuxTileEncoding {
     pub tile_width: usize,
     pub tile_height: u32,
     pub deflate_level: u32,
+    pub lerc_options: Option<LercOptions>,
+    pub jpeg_options: Option<JpegOptions>,
 }
 
 /// Compress decoded tile samples into a remux-ready payload.
@@ -2719,8 +2763,8 @@ pub fn remux_compress_tile<T: NumericSample>(
         samples_per_pixel: encoding.samples_per_pixel,
         row_width_pixels: encoding.tile_width,
         block_height: encoding.tile_height,
-        lerc_options: None,
-        jpeg_options: None,
+        lerc_options: encoding.lerc_options,
+        jpeg_options: encoding.jpeg_options,
         jpeg_sampling: None,
         deflate_level: Some(encoding.deflate_level),
     };

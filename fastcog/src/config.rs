@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use gdal_alt_core::{CogOutputOptions, CompressionChoice, ResamplingChoice};
+use gdal_alt_core::{
+    CogOutputOptions, CompressionChoice, LercAdditionalCompressionChoice, ResamplingChoice,
+};
 use std::path::PathBuf;
 
 /// Convert rasters to Cloud Optimized GeoTIFF (COG) format.
@@ -23,9 +25,21 @@ pub struct Args {
     #[arg(short = 'c', long, value_enum, default_value_t = CompressionArg::Deflate)]
     pub compress: CompressionArg,
 
-    /// Deflate compression level (0-9)
+    /// Deflate/ZSTD compression level (0-9)
     #[arg(long, default_value_t = 6)]
     pub deflate_level: u32,
+
+    /// JPEG quality when using JPEG compression (1-100)
+    #[arg(long, default_value_t = 75)]
+    pub jpeg_quality: u8,
+
+    /// Maximum per-sample error for LERC compression (0 = lossless)
+    #[arg(long, default_value_t = 0.0)]
+    pub lerc_max_z_error: f64,
+
+    /// Additional compression for LERC payloads: none, deflate, or zstd
+    #[arg(long, value_enum, default_value_t = LercAdditionalCompressionArg::None)]
+    pub lerc_additional_compression: LercAdditionalCompressionArg,
 
     /// Overview resampling method
     #[arg(short = 'r', long, value_enum, default_value_t = ResamplingArg::Average)]
@@ -50,6 +64,18 @@ pub struct Args {
     /// Suppress progress output (enabled by default on interactive terminals)
     #[arg(short = 'q', long)]
     pub quiet: bool,
+
+    /// Do not synthesize a GDAL mask IFD from an associated alpha band
+    #[arg(long)]
+    pub no_mask_from_alpha: bool,
+
+    /// Treat RGB(0,0,0) as transparent and emit a mask IFD when none exists
+    #[arg(long)]
+    pub black_rgb_transparent: bool,
+
+    /// Emit machine-readable JSON stats on stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Args {
@@ -70,14 +96,27 @@ impl Args {
                 CompressionArg::Deflate => CompressionChoice::Deflate,
                 CompressionArg::Zstd => CompressionChoice::Zstd,
                 CompressionArg::Jpeg => CompressionChoice::Jpeg,
+                CompressionArg::Lerc => CompressionChoice::Lerc,
             },
             deflate_level: self.deflate_level,
+            jpeg_quality: self.jpeg_quality,
+            lerc_max_z_error: self.lerc_max_z_error,
+            lerc_additional_compression: match self.lerc_additional_compression {
+                LercAdditionalCompressionArg::None => LercAdditionalCompressionChoice::None,
+                LercAdditionalCompressionArg::Deflate => LercAdditionalCompressionChoice::Deflate,
+                LercAdditionalCompressionArg::Zstd => LercAdditionalCompressionChoice::Zstd,
+            },
             resampling: match self.resampling {
                 ResamplingArg::Nearest => ResamplingChoice::Nearest,
                 ResamplingArg::Average => ResamplingChoice::Average,
+                ResamplingArg::Bilinear => ResamplingChoice::Bilinear,
+                ResamplingArg::Cubic => ResamplingChoice::Cubic,
+                ResamplingArg::Lanczos => ResamplingChoice::Lanczos,
             },
             overview_levels: self.overviews.clone(),
             no_overviews: self.no_overviews,
+            mask_from_alpha: !self.no_mask_from_alpha,
+            black_rgb_transparent: self.black_rgb_transparent,
         }
     }
 }
@@ -89,10 +128,21 @@ pub enum CompressionArg {
     Deflate,
     Zstd,
     Jpeg,
+    Lerc,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LercAdditionalCompressionArg {
+    None,
+    Deflate,
+    Zstd,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ResamplingArg {
     Nearest,
     Average,
+    Bilinear,
+    Cubic,
+    Lanczos,
 }

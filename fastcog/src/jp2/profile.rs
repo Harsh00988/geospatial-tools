@@ -17,23 +17,33 @@ impl Jp2Raster {
         let width = dump.img.orig_width();
         let height = dump.img.orig_height();
         let bands = dump.img.num_components();
-        let bits_per_sample = dump
-            .img
-            .components()
-            .first()
-            .map(|component| component.precision() as u8)
-            .unwrap_or(8);
+        if bands == 0 {
+            bail!("JP2 image has no components");
+        }
+
+        let components: Vec<_> = dump.img.components().iter().collect();
+        let bits_per_sample = components[0].precision() as u8;
+        let signed = components[0].is_signed();
+        for component in &components {
+            if component.precision() as u8 != bits_per_sample {
+                bail!("JP2 components must share the same bit depth");
+            }
+            if component.is_signed() != signed {
+                bail!("JP2 components must share the same signedness");
+            }
+        }
+        if signed {
+            bail!("signed JP2 components are not supported yet");
+        }
+        if !matches!(bits_per_sample, 8 | 12 | 16) {
+            bail!("JP2 fast path supports 8/12/16-bit unsigned imagery (got {bits_per_sample}-bit)");
+        }
 
         let photometric = match bands {
+            1 => PhotometricInterpretation::MinIsBlack,
             3 => PhotometricInterpretation::Rgb,
-            _ => bail!(
-                "JP2 streaming path currently requires 3-band RGB imagery (got {bands} bands)"
-            ),
+            _ => PhotometricInterpretation::MinIsBlack,
         };
-
-        if bits_per_sample != 8 {
-            bail!("JP2 fast path currently supports 8-bit imagery (got {bits_per_sample}-bit)");
-        }
 
         Ok(Self {
             width,

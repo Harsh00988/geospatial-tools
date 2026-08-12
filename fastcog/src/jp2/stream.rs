@@ -1,5 +1,5 @@
 use crate::config::Args;
-use crate::jp2::decode::{self, Region, RgbPlanes};
+use crate::jp2::decode::{self, Jp2Sample, Planes, Region};
 use crate::jp2::profile::Jp2Raster;
 use gdal_alt_core::cog::{
     apply_compression, configure_cog_with_levels, layer_sizes, overview_levels, tiff_variant,
@@ -8,7 +8,7 @@ use gdal_alt_core::input::{apply_georef, GeorefProfile};
 use gdal_alt_core::progress::{ProgressTracker, StageBar};
 use gdal_alt_core::util::ensure_parent_dir;
 use anyhow::{Context, Result};
-use geotiff_writer::cog::{pack_u8_planar_tile, LayerEncodePlan, PackedPlanarTile};
+use geotiff_writer::cog::{pack_planar_tile, LayerEncodePlan, PackedPlanarTile};
 use geotiff_writer::GeoTiffBuilder;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -20,6 +20,20 @@ use tiff_core::PlanarConfiguration;
 const OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn convert(
+    args: &Args,
+    pool: &rayon::ThreadPool,
+    mmap: Arc<Mmap>,
+    raster: Jp2Raster,
+    georef: GeorefProfile,
+) -> Result<()> {
+    match raster.bits_per_sample {
+        8 => convert_typed::<u8>(args, pool, mmap, raster, georef),
+        12 | 16 => convert_typed::<u16>(args, pool, mmap, raster, georef),
+        bits => anyhow::bail!("unsupported JP2 bit depth: {bits}"),
+    }
+}
+
+fn convert_typed<T: Jp2Sample>(
     args: &Args,
     pool: &rayon::ThreadPool,
     mmap: Arc<Mmap>,
@@ -63,7 +77,7 @@ pub fn convert(
             .with_context(|| format!("failed to create {}", args.output.display()))?
     };
     let sink = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
-    let mut stream = cog_builder.begin_planar_stream::<u8, _>(
+    let mut stream = cog_builder.begin_planar_stream::<T, _>(
         sink,
         width as usize,
         height as usize,
@@ -93,7 +107,7 @@ pub fn convert(
             levels_for_overviews
                 .par_iter()
                 .map(|&level| {
-                    let packed = pack_overview(mmap_overviews.as_ref(), level, encode_plan)?;
+                    let packed = pack_overview::<T>(mmap_overviews.as_ref(), level, encode_plan)?;
                     overview_bar.inc(1);
                     Ok(packed)
                 })
@@ -106,7 +120,7 @@ pub fn convert(
 
     let base_packed = pool.install(|| -> Result<Vec<PackedPlanarTile>> {
         let ctx = TileGrid::new(width, height, encode_plan);
-        let base_packed = encode_base_layer(mmap_base.as_ref(), &ctx, decode_bar.clone())?;
+        let base_packed = encode_base_layer::<T>(mmap_base.as_ref(), &ctx, decode_bar.clone())?;
         decode_bar.done("done");
         Ok(base_packed)
     })?;
@@ -158,22 +172,26 @@ impl TileGrid {
     }
 }
 
-fn pack_overview(data: &[u8], level: u32, plan: LayerEncodePlan) -> Result<Vec<PackedPlanarTile>> {
+fn pack_overview<T: Jp2Sample>(
+    data: &[u8],
+    level: u32,
+    plan: LayerEncodePlan,
+) -> Result<Vec<PackedPlanarTile>> {
     let image = decode::decode_overview(data, level.trailing_zeros())?;
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let planes = decode::rgb_planes(&image)?;
-    decode::pack_rgb_planes(&planes, width, height, plan)
+    let planes = T::planes(&image)?;
+    T::pack_planes(&planes, width, height, plan)
 }
 
-fn encode_base_layer(
+fn encode_base_layer<T: Jp2Sample>(
     data: &[u8],
     grid: &TileGrid,
     progress: StageBar,
 ) -> Result<Vec<PackedPlanarTile>> {
     decode::regions(grid.width, grid.height)
         .par_iter()
-        .map(|region| pack_region(data, region, grid))
+        .map(|region| pack_region::<T>(data, region, grid))
         .inspect(|result| {
             if result.is_ok() {
                 progress.inc(1);
@@ -183,12 +201,13 @@ fn encode_base_layer(
         .map(|nested| nested.into_iter().flatten().collect())
 }
 
-fn pack_region(data: &[u8], region: &Region, grid: &TileGrid) -> Result<Vec<PackedPlanarTile>> {
+fn pack_region<T: Jp2Sample>(
+    data: &[u8],
+    region: &Region,
+    grid: &TileGrid,
+) -> Result<Vec<PackedPlanarTile>> {
     let image = region.decode(data)?;
-    let RgbPlanes {
-        planes,
-        width: comp_w,
-    } = decode::rgb_planes(&image)?;
+    let Planes { planes, width: comp_w } = T::planes(&image)?;
 
     let tw = grid.tile_width;
     let th = grid.tile_height;
@@ -208,7 +227,7 @@ fn pack_region(data: &[u8], region: &Region, grid: &TileGrid) -> Result<Vec<Pack
                 let local_col = col_off - region.x0 as usize;
                 let local_row = row_off - region.y0 as usize;
 
-                let mut tile_data = vec![0u8; tw * th];
+                let mut tile_data = vec![T::default(); tw * th];
                 for row in 0..rows {
                     let src_row = (local_row + row) * comp_w + local_col;
                     let dst_row = row * tw;
@@ -219,7 +238,7 @@ fn pack_region(data: &[u8], region: &Region, grid: &TileGrid) -> Result<Vec<Pack
                 let block_index =
                     band * grid.tiles_per_plane + cog_row * grid.tiles_across + cog_col;
                 packed.push(
-                    pack_u8_planar_tile(&tile_data, block_index, grid.plan)
+                    pack_planar_tile(&tile_data, block_index, grid.plan)
                         .map_err(|err| anyhow::anyhow!(err))?,
                 );
             }

@@ -11,12 +11,13 @@ use tiff_reader::TiffSample;
 use crate::cog::{configure_cog, tile_jobs, CogOutputOptions};
 use crate::crop::WriteWindow;
 use crate::input::RasterProfile;
-use crate::open::open_geotiff;
+use crate::open::{open_input, GeoTiffHandle};
+use crate::path::{log_convert_path, ConvertPath};
 use crate::progress::{ProgressTracker, StageBar};
 use crate::util::ensure_parent_dir;
 
 pub struct ConvertRequest<'a> {
-    pub input: &'a Path,
+    pub input: &'a str,
     pub output: &'a Path,
     pub opts: &'a CogOutputOptions,
     pub mmap: bool,
@@ -25,11 +26,16 @@ pub struct ConvertRequest<'a> {
     pub bands: Option<Vec<usize>>,
 }
 
-pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -> Result<()> {
+pub struct ConvertResult {
+    pub path: ConvertPath,
+}
+
+pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -> Result<ConvertResult> {
     request.opts.validate()?;
     ensure_parent_dir(request.output)?;
-    let input = open_geotiff(request.input, request.mmap)?;
-    let mut profile = RasterProfile::from_geotiff(&input)?;
+    let handle = open_input(request.input, request.mmap)?;
+    let input = handle.as_file();
+    let mut profile = RasterProfile::from_geotiff(input)?;
     if let Some(window) = &request.window {
         profile = profile.with_window(window);
     }
@@ -38,8 +44,9 @@ pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -
         profile = profile.with_band_subset(bands);
     }
 
-    if crate::remux::try_remux_cog(
-        &input,
+    if let Some(path) = crate::remux::try_remux_cog(
+        pool,
+        input,
         request.output,
         &profile,
         request.opts,
@@ -47,10 +54,13 @@ pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -
         request.bands.as_deref(),
         request.show_progress,
     )? {
-        return Ok(());
+        log_convert_path(path, request.show_progress);
+        return Ok(ConvertResult { path });
     }
 
-    dispatch_by_sample(pool, request, &input, &profile)
+    let path = dispatch_by_sample(pool, request, input, &profile, &handle)?;
+    log_convert_path(path, request.show_progress);
+    Ok(ConvertResult { path })
 }
 
 fn validate_bands(bands: &[usize], band_count: usize) -> Result<()> {
@@ -70,7 +80,8 @@ fn dispatch_by_sample(
     request: &ConvertRequest<'_>,
     input: &GeoTiffFile,
     profile: &RasterProfile,
-) -> Result<()> {
+    _handle: &GeoTiffHandle,
+) -> Result<ConvertPath> {
     let bits = profile.sample.bits_per_sample;
     let format = profile.sample.sample_format;
     match (bits, format) {
@@ -98,19 +109,29 @@ fn convert_typed<T>(
     request: &ConvertRequest<'_>,
     input: &GeoTiffFile,
     profile: &RasterProfile,
-) -> Result<()>
+) -> Result<ConvertPath>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone + Copy + Default,
+    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone + Copy + Default + PartialEq,
 {
     let base_ifd = input
         .tiff()
         .ifd(input.base_ifd_index())
         .context("failed to read base IFD")?;
     if !base_ifd.is_tiled() {
-        return convert_strip_remux::<T>(pool, request, input, profile);
+        crate::strip_encode::convert_strip_to_remux_cog::<T>(
+            pool,
+            input,
+            request.output,
+            profile,
+            request.opts,
+            request.window,
+            request.bands.as_deref(),
+            request.show_progress,
+        )?;
+        return Ok(ConvertPath::StripEncode);
     }
 
-    return crate::tiled_encode::convert_tiled_to_remux_cog::<T>(
+    crate::tiled_encode::convert_tiled_to_remux_cog::<T>(
         pool,
         input,
         request.output,
@@ -119,28 +140,8 @@ where
         request.window,
         request.bands.as_deref(),
         request.show_progress,
-    );
-}
-
-fn convert_strip_remux<T>(
-    pool: &rayon::ThreadPool,
-    request: &ConvertRequest<'_>,
-    input: &GeoTiffFile,
-    profile: &RasterProfile,
-) -> Result<()>
-where
-    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone + Copy + Default,
-{
-    crate::strip_encode::convert_strip_to_remux_cog::<T>(
-        pool,
-        input,
-        request.output,
-        profile,
-        request.opts,
-        request.window,
-        request.bands.as_deref(),
-        request.show_progress,
-    )
+    )?;
+    Ok(ConvertPath::TiledEncode)
 }
 
 fn convert_strip_batched<T>(

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use gdal_alt_core::{
-    convert_geotiff, window_from_projwin, window_from_srcwin, CompressionChoice, ConvertRequest,
-    CogOutputOptions, ResamplingChoice,
+    convert_geotiff, window_from_projwin, window_from_srcwin, CompressionChoice,
+    ConvertRequest, CogOutputOptions, LercAdditionalCompressionChoice, ResamplingChoice,
 };
 use std::path::PathBuf;
 
@@ -55,12 +55,16 @@ enum CompressionArg {
     Deflate,
     Zstd,
     Jpeg,
+    Lerc,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ResamplingArg {
     Nearest,
     Average,
+    Bilinear,
+    Cubic,
+    Lanczos,
 }
 
 fn main() -> Result<()> {
@@ -75,26 +79,28 @@ fn main() -> Result<()> {
     let opts = cog_options(&args);
     opts.validate()?;
 
-    let input = gdal_alt_core::open::open_geotiff(&args.input, args.mmap)?;
+    let input = args.input.to_string_lossy();
+    let handle = gdal_alt_core::open::open_input(&input, args.mmap)?;
+    let geotiff = handle.as_file();
     let window = if let Some(values) = &args.srcwin {
         let [col, row, width, height] = values.as_slice() else {
             anyhow::bail!("--srcwin requires four integers");
         };
-        window_from_srcwin(input.width(), input.height(), *col, *row, *width, *height)?
+        window_from_srcwin(geotiff.width(), geotiff.height(), *col, *row, *width, *height)?
     } else {
         let values = args.projwin.as_ref().unwrap();
         let [ulx, uly, lrx, lry] = values.as_slice() else {
             anyhow::bail!("--projwin requires four coordinates");
         };
-        window_from_projwin(&input, *ulx, *uly, *lrx, *lry)?
+        window_from_projwin(geotiff, *ulx, *uly, *lrx, *lry)?
     };
 
     let pool = gdal_alt_core::util::thread_pool(args.jobs)?;
     let started = std::time::Instant::now();
-    convert_geotiff(
+    let _result = convert_geotiff(
         &pool,
         &ConvertRequest {
-            input: &args.input,
+            input: &input,
             output: &args.output,
             opts: &opts,
             mmap: args.mmap,
@@ -120,13 +126,22 @@ fn cog_options(args: &Args) -> CogOutputOptions {
             CompressionArg::Deflate => CompressionChoice::Deflate,
             CompressionArg::Zstd => CompressionChoice::Zstd,
             CompressionArg::Jpeg => CompressionChoice::Jpeg,
+            CompressionArg::Lerc => CompressionChoice::Lerc,
         },
         deflate_level: args.deflate_level,
+        jpeg_quality: 75,
+        lerc_max_z_error: 0.0,
+        lerc_additional_compression: LercAdditionalCompressionChoice::None,
         resampling: match args.resampling {
             ResamplingArg::Nearest => ResamplingChoice::Nearest,
             ResamplingArg::Average => ResamplingChoice::Average,
+            ResamplingArg::Bilinear => ResamplingChoice::Bilinear,
+            ResamplingArg::Cubic => ResamplingChoice::Cubic,
+            ResamplingArg::Lanczos => ResamplingChoice::Lanczos,
         },
         overview_levels: args.overviews.clone(),
         no_overviews: args.no_overviews,
+        mask_from_alpha: true,
+        black_rgb_transparent: false,
     }
 }

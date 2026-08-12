@@ -5,11 +5,11 @@ use geotiff_reader::GeoTiffFile;
 use geotiff_writer::{remux_compress_tile, RemuxCompressedBlock, RemuxTileEncoding};
 use ndarray::{Array2, Array3, Axis, s};
 use rayon::prelude::*;
-use tiff_core::Predictor;
 use tiff_reader::TiffSample;
 
 use crate::cog::{overview_levels, tile_jobs, CogOutputOptions, TileJob};
 use crate::crop::WriteWindow;
+use crate::encode_overview::encode_layers_with_spool;
 use crate::input::RasterProfile;
 use crate::progress::{ProgressTracker, StageBar};
 use crate::remux::{remux_encoded_layers, resolve_overview_read_source};
@@ -25,8 +25,9 @@ pub fn convert_strip_to_remux_cog<T>(
     show_progress: bool,
 ) -> Result<()>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync + PartialEq,
 {
+    let nodata = crate::cog::semantics::parse_nodata::<T>(&profile.sample, &profile.nodata);
     let width = profile.width;
     let height = profile.height;
     let out_bands = profile.bands as usize;
@@ -38,8 +39,7 @@ where
     let encode_bar = progress.stage("Encode tiles", encode_total);
 
     let layers = pool.install(|| {
-        let mut layers = Vec::with_capacity(1 + levels.len());
-        layers.push(build_strip_base_layer::<T>(
+        encode_layers_with_spool::<T>(
             input,
             width,
             height,
@@ -48,72 +48,11 @@ where
             window,
             band_map,
             encoding,
+            opts,
+            &levels,
+            nodata,
             Some(&encode_bar),
-        )?);
-
-        let mut parent_decoded: Option<Vec<(usize, usize, StripTile<T>)>> = None;
-        let mut parent_level = 1u32;
-        for (level_idx, &level) in levels.iter().enumerate() {
-            let chain_next = levels
-                .iter()
-                .skip(level_idx + 1)
-                .any(|&next| next == level * 2);
-            let (layer, decoded) = if let Some(parent) = parent_decoded.take() {
-                if level == parent_level * 2 {
-                    build_strip_overview_from_decoded::<T>(
-                        parent,
-                        width,
-                        height,
-                        level,
-                        parent_level,
-                        tile_size,
-                        out_bands,
-                        encoding,
-                        opts,
-                        chain_next,
-                        Some(&encode_bar),
-                    )?
-                } else {
-                    build_strip_overview_layer_with_cache::<T>(
-                        input,
-                        width,
-                        height,
-                        level,
-                        tile_size,
-                        out_bands,
-                        window,
-                        band_map,
-                        encoding,
-                        opts,
-                        chain_next,
-                        Some(&encode_bar),
-                    )?
-                }
-            } else {
-                build_strip_overview_layer_with_cache::<T>(
-                    input,
-                    width,
-                    height,
-                    level,
-                    tile_size,
-                    out_bands,
-                    window,
-                    band_map,
-                    encoding,
-                    opts,
-                    chain_next,
-                    Some(&encode_bar),
-                )?
-            };
-
-            if chain_next {
-                parent_decoded = Some(decoded);
-                parent_level = level;
-            }
-            layers.push(layer);
-        }
-
-        Ok::<_, anyhow::Error>(layers)
+        )
     })?;
 
     encode_bar.done("done");
@@ -123,6 +62,7 @@ where
         opts,
         layers,
         output,
+        window.as_ref(),
         Some(levels),
         None,
         show_progress,
@@ -148,6 +88,166 @@ pub(crate) fn encode_row_group_total(
 
 fn row_group_count(width: u32, height: u32, tile_size: usize) -> u64 {
     (height as usize).div_ceil(tile_size) as u64
+}
+
+fn strip_rows_per_strip(input: &GeoTiffFile) -> Result<usize> {
+    let ifd = input.tiff().ifd(input.base_ifd_index())?;
+    Ok(ifd.rows_per_strip().max(1) as usize)
+}
+
+/// When each TIFF strip spans more than one tile row, decode each strip once and
+/// slice tiles from the decoded buffer instead of re-decompressing per row group.
+fn should_decode_strips_once(rows_per_strip: usize, tile_size: usize, window: Option<WriteWindow>) -> bool {
+    window.is_none() && rows_per_strip > tile_size
+}
+
+fn build_base_layer_from_decoded_strips<T>(
+    input: &GeoTiffFile,
+    width: u32,
+    height: u32,
+    tile_size: usize,
+    rows_per_strip: usize,
+    out_bands: usize,
+    band_map: Option<&[usize]>,
+    encoding: RemuxTileEncoding,
+    progress: Option<&StageBar>,
+) -> Result<Vec<RemuxCompressedBlock>>
+where
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync + Clone,
+{
+    let image_height = height as usize;
+    let image_width = width as usize;
+    let tiles = tile_jobs(width, height, tile_size as u32);
+    let tile_index_by_pos: std::collections::HashMap<(usize, usize), usize> = tiles
+        .iter()
+        .enumerate()
+        .map(|(idx, job)| ((job.col_off, job.row_off), idx))
+        .collect();
+
+    let strip_count = image_height.div_ceil(rows_per_strip);
+    let mut jobs_by_strip: BTreeMap<usize, Vec<TileJob>> = BTreeMap::new();
+    for job in tiles {
+        let strip_idx = job.row_off / rows_per_strip;
+        jobs_by_strip.entry(strip_idx).or_default().push(job);
+    }
+
+    let mut blocks = (0..strip_count)
+        .into_par_iter()
+        .map(|strip_idx| -> Result<Vec<(usize, RemuxCompressedBlock)>> {
+            let row_start = strip_idx * rows_per_strip;
+            let row_count = rows_per_strip.min(image_height.saturating_sub(row_start));
+            let strip_tile = read_decoded_strip::<T>(
+                input,
+                row_start,
+                0,
+                row_count,
+                image_width,
+                out_bands,
+                band_map,
+            )?;
+
+            let jobs = jobs_by_strip
+                .get(&strip_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let out = jobs
+                .par_iter()
+                .map(|job| {
+                    let tile = slice_strip_tile(
+                        &strip_tile,
+                        job,
+                        row_start,
+                        out_bands,
+                    )?;
+                    let block_index = tile_index_by_pos[&(job.col_off, job.row_off)];
+                    let samples = encode_tile_samples(&tile, tile_size, out_bands)?;
+                    let block = remux_compress_tile(&samples, block_index, encoding)
+                        .map_err(|err| anyhow::anyhow!(err))?;
+                    Ok((block_index, block))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            if let Some(bar) = progress {
+                bar.inc(1);
+            }
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    blocks.sort_by_key(|(index, _)| *index);
+    Ok(blocks.into_iter().map(|(_, block)| block).collect())
+}
+
+fn read_decoded_strip<T>(
+    input: &GeoTiffFile,
+    row_start: usize,
+    col_start: usize,
+    row_count: usize,
+    col_count: usize,
+    out_bands: usize,
+    band_map: Option<&[usize]>,
+) -> Result<StripTile<T>>
+where
+    T: TiffSample + Clone,
+{
+    if out_bands == 1 {
+        let band_index = band_map.map(|bands| bands[0] - 1).unwrap_or(0);
+        let data = input.read_band_window::<T>(
+            band_index,
+            row_start,
+            col_start,
+            row_count,
+            col_count,
+        )?;
+        let data = data
+            .into_dimensionality::<ndarray::Ix2>()
+            .context("expected 2D decoded strip")?;
+        Ok(StripTile::Single(data))
+    } else {
+        let data = input.read_window::<T>(row_start, col_start, row_count, col_count)?;
+        let data = data
+            .into_dimensionality::<ndarray::Ix3>()
+            .context("expected [rows, cols, bands] decoded strip")?;
+        let data = if let Some(bands) = band_map {
+            select_bands(&data, bands)?
+        } else {
+            data
+        };
+        Ok(StripTile::Multi(data))
+    }
+}
+
+fn slice_strip_tile<T: Clone>(
+    strip: &StripTile<T>,
+    job: &TileJob,
+    strip_row_start: usize,
+    out_bands: usize,
+) -> Result<StripTile<T>> {
+    let rel_row = job.row_off.saturating_sub(strip_row_start);
+    match strip {
+        StripTile::Single(data) => {
+            let tile = data
+                .slice(s![rel_row..rel_row + job.rows, job.col_off..job.col_off + job.cols])
+                .to_owned();
+            Ok(StripTile::Single(tile))
+        }
+        StripTile::Multi(data) => {
+            let tile = data
+                .slice(s![
+                    rel_row..rel_row + job.rows,
+                    job.col_off..job.col_off + job.cols,
+                    ..
+                ])
+                .to_owned();
+            if tile.len_of(Axis(2)) != out_bands {
+                anyhow::bail!("unexpected band count in strip tile slice");
+            }
+            Ok(StripTile::Multi(tile))
+        }
+    }
 }
 
 fn build_strip_base_layer<T>(
@@ -191,6 +291,21 @@ pub(crate) fn build_base_layer_from_rows<T>(
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
 {
+    let rows_per_strip = strip_rows_per_strip(input)?;
+    if should_decode_strips_once(rows_per_strip, tile_size, window) {
+        return build_base_layer_from_decoded_strips::<T>(
+            input,
+            width,
+            height,
+            tile_size,
+            rows_per_strip,
+            out_bands,
+            band_map,
+            encoding,
+            progress,
+        );
+    }
+
     let tiles = tile_jobs(width, height, tile_size as u32);
     let tile_index_by_pos: std::collections::HashMap<(usize, usize), usize> = tiles
         .iter()
@@ -240,11 +355,12 @@ pub(crate) fn build_strip_overview_layer_with_cache<T>(
     band_map: Option<&[usize]>,
     encoding: RemuxTileEncoding,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
     cache_decoded: bool,
     progress: Option<&StageBar>,
 ) -> Result<(Vec<RemuxCompressedBlock>, Vec<(usize, usize, StripTile<T>)>)>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync + PartialEq,
 {
     let ov_width = (width / level).max(1);
     let ov_height = (height / level).max(1);
@@ -283,6 +399,7 @@ where
                 tile_size,
                 encoding,
                 opts,
+                nodata,
                 &tile_index_by_pos,
             )
         })
@@ -317,11 +434,12 @@ pub(crate) fn build_strip_overview_from_decoded<T>(
     out_bands: usize,
     encoding: RemuxTileEncoding,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
     cache_decoded: bool,
     progress: Option<&StageBar>,
 ) -> Result<(Vec<RemuxCompressedBlock>, Vec<(usize, usize, StripTile<T>)>)>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync + PartialEq,
 {
     let downsample = (level / parent_level).max(1) as usize;
     let ov_width = (width / level).max(1);
@@ -347,6 +465,7 @@ where
                 out_bands,
                 tile_size,
                 opts,
+                nodata,
             )?;
             let samples = encode_tile_samples(&tile, tile_size, out_bands)?;
             let block = remux_compress_tile(&samples, block_index, encoding)
@@ -379,9 +498,10 @@ fn downsample_parent_tile<T>(
     out_bands: usize,
     tile_size: usize,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
 ) -> Result<StripTile<T>>
 where
-    T: geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+    T: geotiff_writer::NumericSample + Copy + Default + Send + Sync + PartialEq,
 {
     let parent_col = job.col_off * downsample;
     let parent_row = job.row_off * downsample;
@@ -415,7 +535,7 @@ where
                     );
                 }
             }
-            StripTile::Single(downsample_2d(&canvas, job.rows, job.cols, downsample, opts)?)
+            StripTile::Single(downsample_2d(&canvas, job.rows, job.cols, downsample, opts, nodata)?)
         }
         _ => {
             let mut canvas = Array3::default((parent_rows, parent_cols, out_bands));
@@ -443,7 +563,7 @@ where
                     );
                 }
             }
-            StripTile::Multi(downsample_3d(&canvas, job.rows, job.cols, downsample, opts)?)
+            StripTile::Multi(downsample_3d(&canvas, job.rows, job.cols, downsample, opts, nodata)?)
         }
     };
     Ok(stitched)
@@ -555,9 +675,10 @@ fn read_overview_source<T>(
     out_rows: usize,
     out_cols: usize,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
 ) -> Result<StripTile<T>>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync + PartialEq,
 {
     if out_bands == 1 {
         let band_index = band_map.map(|bands| bands[0] - 1).unwrap_or(0);
@@ -565,7 +686,7 @@ where
         let data = data
             .into_dimensionality::<ndarray::Ix2>()
             .context("expected 2D overview source")?;
-        let downsampled = downsample_2d(&data, out_rows, out_cols, scale, opts)?;
+        let downsampled = downsample_2d(&data, out_rows, out_cols, scale, opts, nodata)?;
         Ok(StripTile::Single(downsampled))
     } else {
         let data = input.read_window::<T>(src_row, src_col, src_rows, src_cols)?;
@@ -577,7 +698,7 @@ where
         } else {
             data
         };
-        let downsampled = downsample_3d(&data, out_rows, out_cols, scale, opts)?;
+        let downsampled = downsample_3d(&data, out_rows, out_cols, scale, opts, nodata)?;
         Ok(StripTile::Multi(downsampled))
     }
 }
@@ -588,14 +709,19 @@ fn downsample_2d<T>(
     out_cols: usize,
     scale: usize,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
 ) -> Result<Array2<T>>
 where
-    T: geotiff_writer::NumericSample + Copy + Default,
+    T: geotiff_writer::NumericSample + Copy + Default + PartialEq,
 {
-    match opts.resampling {
-        crate::cog::ResamplingChoice::Nearest => Ok(nearest_downsample_2d(src, out_rows, out_cols, scale)),
-        crate::cog::ResamplingChoice::Average => Ok(average_downsample_2d(src, out_rows, out_cols, scale)),
-    }
+    Ok(crate::resample::downsample_2d(
+        src,
+        out_rows,
+        out_cols,
+        scale,
+        opts.resampling,
+        nodata,
+    ))
 }
 
 fn downsample_3d<T>(
@@ -604,18 +730,19 @@ fn downsample_3d<T>(
     out_cols: usize,
     scale: usize,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
 ) -> Result<Array3<T>>
 where
-    T: geotiff_writer::NumericSample + Copy + Default,
+    T: geotiff_writer::NumericSample + Copy + Default + PartialEq,
 {
-    match opts.resampling {
-        crate::cog::ResamplingChoice::Nearest => {
-            Ok(nearest_downsample_3d(src, out_rows, out_cols, scale))
-        }
-        crate::cog::ResamplingChoice::Average => {
-            Ok(average_downsample_3d(src, out_rows, out_cols, scale))
-        }
-    }
+    Ok(crate::resample::downsample_3d(
+        src,
+        out_rows,
+        out_cols,
+        scale,
+        opts.resampling,
+        nodata,
+    ))
 }
 
 fn nearest_downsample_2d<T: Copy + Default>(
@@ -804,10 +931,11 @@ fn read_overview_row_batch<T>(
     tile_size: usize,
     encoding: RemuxTileEncoding,
     opts: &CogOutputOptions,
+    nodata: Option<T>,
     tile_index_by_pos: &std::collections::HashMap<(usize, usize), usize>,
 ) -> Result<Vec<(usize, usize, usize, StripTile<T>, RemuxCompressedBlock)>>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync + PartialEq,
 {
     let mut out = Vec::with_capacity(jobs.len());
     if source_layer > 0 && layer_downsample == 1 {
@@ -882,6 +1010,7 @@ where
                 job.rows,
                 job.cols,
                 opts,
+                nodata,
             )?
         } else {
             let (src_col, src_row, src_cols, src_rows, downsample) =
@@ -899,7 +1028,7 @@ where
                 let data = data
                     .into_dimensionality::<ndarray::Ix2>()
                     .context("expected 2D overview source")?;
-                let downsampled = downsample_2d(&data, job.rows, job.cols, downsample, opts)?;
+                let downsampled = downsample_2d(&data, job.rows, job.cols, downsample, opts, nodata)?;
                 StripTile::Single(downsampled)
             } else {
                 let data = input.read_overview_window::<T>(
@@ -917,7 +1046,7 @@ where
                 } else {
                     data
                 };
-                let downsampled = downsample_3d(&data, job.rows, job.cols, downsample, opts)?;
+                let downsampled = downsample_3d(&data, job.rows, job.cols, downsample, opts, nodata)?;
                 StripTile::Multi(downsampled)
             };
             raw
@@ -1028,12 +1157,5 @@ fn pad_tile_chunky<T: Copy + Default>(
 }
 
 pub(crate) fn output_tile_encoding(opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
-    RemuxTileEncoding {
-        compression: opts.compression.to_compression(),
-        predictor: Predictor::None,
-        samples_per_pixel: spp,
-        tile_width: tile_size,
-        tile_height: tile_size as u32,
-        deflate_level: opts.deflate_level,
-    }
+    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, None)
 }

@@ -7,9 +7,9 @@ use tiff_core::Compression;
 use tiff_core::SampleFormat;
 
 use crate::geo;
-use crate::input::{detect, InputFormat};
+use crate::input::{detect, detect_source, InputFormat};
 use crate::jp2::Jp2Header;
-use crate::open::open_geotiff;
+use crate::open::{open_geotiff, open_input};
 use crate::util;
 
 #[derive(Debug, Clone)]
@@ -43,11 +43,15 @@ pub struct OverviewInfo {
     pub block_y: Option<u32>,
 }
 
-pub fn gather(path: &Path, mmap: bool) -> Result<RasterInfo> {
-    match detect(path) {
-        InputFormat::GeoTiff => geotiff_info(path, mmap),
-        InputFormat::Jp2 => jp2_info(path),
+pub fn gather(source: &str, mmap: bool) -> Result<RasterInfo> {
+    match detect_source(source) {
+        InputFormat::GeoTiff => geotiff_info_source(source, mmap),
+        InputFormat::Jp2 => jp2_info(Path::new(source)),
     }
+}
+
+pub fn gather_path(path: &Path, mmap: bool) -> Result<RasterInfo> {
+    gather(&path.to_string_lossy(), mmap)
 }
 
 pub fn format_text(info: &RasterInfo) -> String {
@@ -129,8 +133,9 @@ impl OverviewInfo {
     }
 }
 
-fn geotiff_info(path: &Path, mmap: bool) -> Result<RasterInfo> {
-    let input = open_geotiff(path, mmap)?;
+fn geotiff_info_source(source: &str, mmap: bool) -> Result<RasterInfo> {
+    let handle = open_input(source, mmap)?;
+    let input = handle.as_file();
     let ifd = input
         .tiff()
         .ifd(input.base_ifd_index())
@@ -162,7 +167,7 @@ fn geotiff_info(path: &Path, mmap: bool) -> Result<RasterInfo> {
 
     Ok(RasterInfo {
         driver: "GeoTIFF".to_owned(),
-        path: path.display().to_string(),
+        path: source.to_owned(),
         width: input.width(),
         height: input.height(),
         bands: input.band_count(),

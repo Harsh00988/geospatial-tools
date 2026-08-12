@@ -8,7 +8,7 @@ description = "Shared geospatial raster I/O for gdal-alternate tools"
 [dependencies]
 anyhow = "1"
 geotiff-core = "0.8"
-geotiff-reader = { version = "0.8", features = ["rayon"] }
+geotiff-reader = { version = "0.8", features = ["rayon", "cog"] }
 geotiff-writer = "0.8"
 tiff-core = "0.8"
 tiff-reader = "0.8"
@@ -17,3 +17,6 @@ rayon = "1.10"
 jpeg2k = { version = "0.10", default-features = false, features = ["openjpeg-sys", "threads"] }
 memmap2 = "0.9"
 indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"

@@ -54,6 +54,17 @@ pub fn window_from_srcwin(
     })
 }
 
+/// Scale a pixel window down for overview-level reads.
+pub(crate) fn scale_window(window: &WriteWindow, scale: u32) -> WriteWindow {
+    let scale = scale.max(1) as usize;
+    WriteWindow {
+        col_off: window.col_off / scale,
+        row_off: window.row_off / scale,
+        width: window.width / scale,
+        height: window.height / scale,
+    }
+}
+
 pub fn window_from_projwin(
     input: &GeoTiffFile,
     ulx: f64,

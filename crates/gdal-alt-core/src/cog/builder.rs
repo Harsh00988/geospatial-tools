@@ -1,5 +1,6 @@
-use geotiff_writer::cog::{CogBuilder, OverviewStorage};
+use geotiff_writer::cog::{CogBuilder, OverviewStorage, RemuxTileEncoding};
 use geotiff_writer::GeoTiffBuilder;
+use tiff_core::Predictor;
 
 use super::grid::auto_overview_levels;
 use super::options::{CogOutputOptions, CompressionChoice};
@@ -10,10 +11,47 @@ pub fn overview_levels(opts: &CogOutputOptions, width: u32, height: u32) -> Vec<
 
 pub fn apply_compression(builder: GeoTiffBuilder, opts: &CogOutputOptions) -> GeoTiffBuilder {
     let mut builder = builder.compression(opts.compression.to_compression());
-    if matches!(opts.compression, CompressionChoice::Deflate) {
-        builder = builder.deflate_level(opts.deflate_level);
+    match opts.compression {
+        CompressionChoice::Deflate | CompressionChoice::Zstd => {
+            builder = builder.deflate_level(opts.deflate_level);
+            builder = builder.predictor(opts.encode_predictor());
+        }
+        CompressionChoice::Lerc => {
+            builder = builder.lerc_options(opts.lerc_options());
+        }
+        CompressionChoice::Jpeg => {
+            builder = builder.jpeg_options(opts.jpeg_options());
+        }
+        CompressionChoice::Lzw => {
+            builder = builder.predictor(opts.encode_predictor());
+        }
+        CompressionChoice::None => {}
     }
     builder
+}
+
+/// Build tile compression parameters for remux/crop/encode hot paths.
+pub fn tile_encoding_from_opts(
+    opts: &CogOutputOptions,
+    tile_size: usize,
+    samples_per_pixel: u16,
+    predictor: Option<Predictor>,
+) -> RemuxTileEncoding {
+    let (lerc_options, jpeg_options) = match opts.compression {
+        CompressionChoice::Lerc => (Some(opts.lerc_options()), None),
+        CompressionChoice::Jpeg => (None, Some(opts.jpeg_options())),
+        _ => (None, None),
+    };
+    RemuxTileEncoding {
+        compression: opts.compression.to_compression(),
+        predictor: predictor.unwrap_or_else(|| opts.encode_predictor()),
+        samples_per_pixel,
+        tile_width: tile_size,
+        tile_height: tile_size as u32,
+        deflate_level: opts.deflate_level,
+        lerc_options,
+        jpeg_options,
+    }
 }
 
 pub fn configure_cog(

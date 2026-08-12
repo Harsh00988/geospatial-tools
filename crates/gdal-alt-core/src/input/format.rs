@@ -1,11 +1,18 @@
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
+
+use crate::open::is_http_source;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
     Jp2,
     GeoTiff,
+}
+
+pub fn detect_source(source: &str) -> InputFormat {
+    if is_http_source(source) {
+        return InputFormat::GeoTiff;
+    }
+    detect(Path::new(source))
 }
 
 pub fn detect(path: &Path) -> InputFormat {
@@ -29,7 +36,8 @@ fn is_jp2_extension(path: &Path) -> bool {
 }
 
 fn sniff_magic(path: &Path) -> Option<InputFormat> {
-    let mut file = File::open(path).ok()?;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
     let mut header = [0u8; 16];
     let read = file.read(&mut header).ok()?;
     if read < 4 {

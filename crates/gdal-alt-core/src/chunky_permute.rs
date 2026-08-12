@@ -126,12 +126,6 @@ fn pad_tile_chunky<T: Copy + Default>(
 }
 
 fn tile_encoding(ifd: &Ifd, opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
-    RemuxTileEncoding {
-        compression: opts.compression.to_compression(),
-        predictor: Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None),
-        samples_per_pixel: spp,
-        tile_width: tile_size,
-        tile_height: tile_size as u32,
-        deflate_level: opts.deflate_level,
-    }
+    let predictor = Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None);
+    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, Some(predictor))
 }

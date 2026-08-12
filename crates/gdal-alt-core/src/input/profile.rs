@@ -144,9 +144,21 @@ impl RasterProfile {
         if profile.bands == 3 {
             profile.photometric = PhotometricInterpretation::Rgb;
         }
-        profile.extra_samples.clear();
+        if let Some(alpha_band) = associated_alpha_band_index(self) {
+            if bands.contains(&alpha_band) {
+                profile.extra_samples = self.extra_samples.clone();
+            } else {
+                profile.extra_samples.clear();
+            }
+        } else {
+            profile.extra_samples.clear();
+        }
         profile
     }
+}
+
+fn associated_alpha_band_index(profile: &RasterProfile) -> Option<usize> {
+    crate::cog::semantics::associated_alpha_band_index(profile)
 }
 
 pub fn apply_georef(mut builder: GeoTiffBuilder, georef: &GeorefProfile) -> GeoTiffBuilder {

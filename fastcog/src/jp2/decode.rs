@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use geotiff_writer::cog::{collect_planar_packed_u8, LayerEncodePlan, PackedPlanarTile};
+use geotiff_writer::cog::{collect_planar_packed, LayerEncodePlan, PackedPlanarTile};
 use jpeg2k::{DecodeArea, DecodeParameters, Image, ImageComponent};
 
 pub const TILE_SIZE: u32 = 1024;
@@ -12,8 +12,8 @@ pub struct Region {
     pub y1: u32,
 }
 
-pub struct RgbPlanes {
-    pub planes: [Vec<u8>; 3],
+pub struct Planes<T> {
+    pub planes: Vec<Vec<T>>,
     pub width: usize,
 }
 
@@ -49,38 +49,93 @@ pub fn decode_overview(data: &[u8], reduce: u32) -> Result<Image> {
     Image::from_bytes_with(data, params).context("failed to decode JP2 overview")
 }
 
-pub fn rgb_planes(image: &Image) -> Result<RgbPlanes> {
-    let components: Vec<&ImageComponent> = image.components().iter().take(3).collect();
-    if components.len() < 3 {
-        anyhow::bail!("expected RGB JP2 image");
+pub fn planes_u8(image: &Image) -> Result<Planes<u8>> {
+    let components: Vec<&ImageComponent> = image.components().iter().collect();
+    if components.is_empty() {
+        anyhow::bail!("JP2 image has no components");
     }
-    Ok(planes_from_components(
-        components[0],
-        components[1],
-        components[2],
-    ))
+    let width = components[0].width() as usize;
+    Ok(Planes {
+        planes: components
+            .iter()
+            .map(|component| component_to_u8(component))
+            .collect(),
+        width,
+    })
 }
 
-pub fn pack_rgb_planes(
-    planes: &RgbPlanes,
+pub fn planes_u16(image: &Image) -> Result<Planes<u16>> {
+    let components: Vec<&ImageComponent> = image.components().iter().collect();
+    if components.is_empty() {
+        anyhow::bail!("JP2 image has no components");
+    }
+    let width = components[0].width() as usize;
+    Ok(Planes {
+        planes: components
+            .iter()
+            .map(|component| component_to_u16(component))
+            .collect(),
+        width,
+    })
+}
+
+pub fn pack_planes_u8(
+    planes: &Planes<u8>,
     width: usize,
     height: usize,
     plan: LayerEncodePlan,
 ) -> Result<Vec<PackedPlanarTile>> {
-    collect_planar_packed_u8(
-        [&planes.planes[0], &planes.planes[1], &planes.planes[2]],
-        width,
-        height,
-        plan,
-    )
-    .map_err(|err| anyhow::anyhow!(err))
+    let refs: Vec<&[u8]> = planes.planes.iter().map(Vec::as_slice).collect();
+    collect_planar_packed(&refs, width, height, plan).map_err(|err| anyhow::anyhow!(err))
 }
 
-fn planes_from_components(r: &ImageComponent, g: &ImageComponent, b: &ImageComponent) -> RgbPlanes {
-    let width = r.width() as usize;
-    RgbPlanes {
-        planes: [component_to_u8(r), component_to_u8(g), component_to_u8(b)],
-        width,
+pub fn pack_planes_u16(
+    planes: &Planes<u16>,
+    width: usize,
+    height: usize,
+    plan: LayerEncodePlan,
+) -> Result<Vec<PackedPlanarTile>> {
+    let refs: Vec<&[u16]> = planes.planes.iter().map(Vec::as_slice).collect();
+    collect_planar_packed(&refs, width, height, plan).map_err(|err| anyhow::anyhow!(err))
+}
+
+pub trait Jp2Sample: geotiff_writer::NumericSample + Copy + Default + Send + Sync {
+    fn planes(image: &Image) -> Result<Planes<Self>>;
+    fn pack_planes(
+        planes: &Planes<Self>,
+        width: usize,
+        height: usize,
+        plan: LayerEncodePlan,
+    ) -> Result<Vec<PackedPlanarTile>>;
+}
+
+impl Jp2Sample for u8 {
+    fn planes(image: &Image) -> Result<Planes<Self>> {
+        planes_u8(image)
+    }
+
+    fn pack_planes(
+        planes: &Planes<Self>,
+        width: usize,
+        height: usize,
+        plan: LayerEncodePlan,
+    ) -> Result<Vec<PackedPlanarTile>> {
+        pack_planes_u8(planes, width, height, plan)
+    }
+}
+
+impl Jp2Sample for u16 {
+    fn planes(image: &Image) -> Result<Planes<Self>> {
+        planes_u16(image)
+    }
+
+    fn pack_planes(
+        planes: &Planes<Self>,
+        width: usize,
+        height: usize,
+        plan: LayerEncodePlan,
+    ) -> Result<Vec<PackedPlanarTile>> {
+        pack_planes_u16(planes, width, height, plan)
     }
 }
 
@@ -90,5 +145,17 @@ fn component_to_u8(component: &ImageComponent) -> Vec<u8> {
         data.iter().map(|&value| value as u8).collect()
     } else {
         component.data_u8().collect()
+    }
+}
+
+fn component_to_u16(component: &ImageComponent) -> Vec<u16> {
+    if component.is_signed() {
+        return component.data_u16().collect();
+    }
+    let data = component.data();
+    if component.precision() <= 16 {
+        data.iter().map(|&value| value as u16).collect()
+    } else {
+        component.data_u16().collect()
     }
 }

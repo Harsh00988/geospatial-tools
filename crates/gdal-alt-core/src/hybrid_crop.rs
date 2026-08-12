@@ -8,7 +8,7 @@ use tiff_reader::{Ifd, TiffSample};
 
 use crate::cog::tile_payload::{ifd_planar, read_layer_block_at};
 use crate::cog::{tile_jobs, CogOutputOptions, TileJob};
-use crate::crop::WriteWindow;
+use crate::crop::{scale_window, WriteWindow};
 use crate::input::RasterProfile;
 use crate::remux::{input_overview_levels, layer_ifd};
 
@@ -340,12 +340,16 @@ fn downsample_planar_tile<T>(
     opts: &CogOutputOptions,
 ) -> Result<Array2<T>>
 where
-    T: geotiff_writer::NumericSample + Copy + Default,
+    T: geotiff_writer::NumericSample + Copy + Default + PartialEq,
 {
-    Ok(match opts.resampling {
-        crate::cog::ResamplingChoice::Nearest => nearest_downsample_2d(src, out_rows, out_cols, scale),
-        crate::cog::ResamplingChoice::Average => average_downsample_2d(src, out_rows, out_cols, scale),
-    })
+    Ok(crate::resample::downsample_2d(
+        src,
+        out_rows,
+        out_cols,
+        scale,
+        opts.resampling,
+        None,
+    ))
 }
 
 fn downsample_chunky_tile<T>(
@@ -356,12 +360,16 @@ fn downsample_chunky_tile<T>(
     opts: &CogOutputOptions,
 ) -> Result<Array3<T>>
 where
-    T: geotiff_writer::NumericSample + Copy + Default,
+    T: geotiff_writer::NumericSample + Copy + Default + PartialEq,
 {
-    Ok(match opts.resampling {
-        crate::cog::ResamplingChoice::Nearest => nearest_downsample_3d(src, out_rows, out_cols, scale),
-        crate::cog::ResamplingChoice::Average => average_downsample_3d(src, out_rows, out_cols, scale),
-    })
+    Ok(crate::resample::downsample_3d(
+        src,
+        out_rows,
+        out_cols,
+        scale,
+        opts.resampling,
+        None,
+    ))
 }
 
 fn nearest_downsample_2d<T: Copy + Default>(
@@ -796,14 +804,8 @@ fn pad_tile_chunky<T: Copy + Default>(
 }
 
 fn tile_encoding(ifd: &Ifd, opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
-    RemuxTileEncoding {
-        compression: opts.compression.to_compression(),
-        predictor: Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None),
-        samples_per_pixel: spp,
-        tile_width: tile_size,
-        tile_height: tile_size as u32,
-        deflate_level: opts.deflate_level,
-    }
+    let predictor = Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None);
+    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, Some(predictor))
 }
 
 fn output_layer_size(
@@ -820,14 +822,4 @@ fn output_layer_size(
         crop_width.div_ceil(scale),
         crop_height.div_ceil(scale),
     )
-}
-
-fn scale_window(window: &WriteWindow, scale: u32) -> WriteWindow {
-    let scale = scale as usize;
-    WriteWindow {
-        col_off: window.col_off / scale,
-        row_off: window.row_off / scale,
-        width: window.width / scale,
-        height: window.height / scale,
-    }
 }

@@ -7,7 +7,9 @@ members = [
     "fastvalidate",
     "fastcrop",
     "fastband",
+    "fasttranslate",
 ]
+exclude = ["python/gdal-alt-py"]
 
 [workspace.package]
 edition = "2021"
