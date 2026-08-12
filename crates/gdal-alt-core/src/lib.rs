@@ -23,4 +23,5 @@ pub use crop::{shift_transform, window_from_projwin, window_from_srcwin, WriteWi
 pub use info::{format_text, gather, RasterInfo};
 pub use input::{detect, InputFormat, RasterProfile, projected_georef};
 pub use validate::{format_report, validate_cog, ValidationLevel, ValidationReport};
+pub use util::{ensure_parent_dir, thread_pool};
 pub use write::{convert_geotiff, ConvertRequest};

@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 const REMUX_OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 use tempfile::tempfile;
-use tiff_core::{ByteOrder, Compression, Predictor, Tag, TagValue, TAG_SUB_IFDS};
+use tiff_core::{ByteOrder, Compression, Predictor, Tag, TagValue, TAG_SUB_IFDS, TAG_TILE_BYTE_COUNTS, TAG_TILE_LENGTH, TAG_TILE_OFFSETS, TAG_TILE_WIDTH};
 use tiff_writer::{encoder, ImageBuilder, TiffVariant};
 use tiff_writer::{JpegOptions, LercOptions};
 
@@ -130,8 +130,68 @@ struct CogBlockRecord {
 
 struct CogImage {
     builder: ImageBuilder,
+    mask: Option<RemuxMaskDescriptor>,
     blocks: Vec<CogBlockRecord>,
     sub_ifd_count: usize,
+}
+
+impl CogImage {
+    fn checked_block_count(&self) -> Result<usize> {
+        if let Some(mask) = &self.mask {
+            Ok(mask_block_count(mask))
+        } else {
+            self.builder.checked_block_count().map_err(Error::from)
+        }
+    }
+
+    fn checked_build_tags(&self, is_bigtiff: bool) -> Result<Vec<Tag>> {
+        if let Some(mask) = &self.mask {
+            build_mask_image_tags(mask, is_bigtiff)
+        } else {
+            build_cog_image_tags(self, is_bigtiff)
+        }
+    }
+
+    fn offset_tag_codes(&self) -> (u16, u16) {
+        if self.mask.is_some() {
+            (TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS)
+        } else {
+            self.builder.offset_tag_codes()
+        }
+    }
+}
+
+fn mask_block_count(mask: &RemuxMaskDescriptor) -> usize {
+    let tiles_across = (mask.width as usize).div_ceil(mask.tile_width as usize);
+    let tiles_down = (mask.height as usize).div_ceil(mask.tile_height as usize);
+    tiles_across * tiles_down
+}
+
+fn build_mask_image_tags(mask: &RemuxMaskDescriptor, is_bigtiff: bool) -> Result<Vec<Tag>> {
+    let num_blocks = mask_block_count(mask);
+    let layout_tags = [
+        Tag::new(TAG_TILE_WIDTH, TagValue::Long(vec![mask.tile_width])),
+        Tag::new(TAG_TILE_LENGTH, TagValue::Long(vec![mask.tile_height])),
+    ];
+    let subfile_type = if mask.overview { 5 } else { 4 };
+    Ok(encoder::build_image_tags(&encoder::ImageTagParams {
+        width: mask.width,
+        height: mask.height,
+        samples_per_pixel: 1,
+        bits_per_sample: 1,
+        sample_format: 1,
+        compression: mask.compression.to_code(),
+        photometric: 4,
+        predictor: 1,
+        planar_configuration: 1,
+        subfile_type,
+        extra_tags: &[],
+        offsets_tag_code: TAG_TILE_OFFSETS,
+        byte_counts_tag_code: TAG_TILE_BYTE_COUNTS,
+        num_blocks,
+        layout_tags: &layout_tags,
+        is_bigtiff,
+    }))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -594,6 +654,9 @@ fn sub_ifds_tag(count: usize, is_bigtiff: bool) -> Result<Tag> {
 }
 
 fn build_cog_image_tags(image: &CogImage, is_bigtiff: bool) -> Result<Vec<Tag>> {
+    if image.mask.is_some() {
+        return image.checked_build_tags(is_bigtiff);
+    }
     let mut tags = image.builder.checked_build_tags(is_bigtiff)?;
     if image.sub_ifd_count > 0 {
         tags.push(sub_ifds_tag(image.sub_ifd_count, is_bigtiff)?);
@@ -620,7 +683,7 @@ fn plan_cog_layout_for_variant(
     )?;
 
     for image in images {
-        let expected_blocks = image.builder.checked_block_count()?;
+        let expected_blocks = image.checked_block_count()?;
         if image.blocks.len() != expected_blocks {
             return Err(Error::Other(format!(
                 "COG image is missing block records: expected {expected_blocks}, got {}",
@@ -719,7 +782,7 @@ fn emit_cog<W: Write + Seek>(
 
     let mut ifd_results = Vec::with_capacity(images.len());
     for (image, planned) in images.iter().zip(&layout.images) {
-        let (offsets_tag_code, byte_counts_tag_code) = image.builder.offset_tag_codes();
+        let (offsets_tag_code, byte_counts_tag_code) = image.offset_tag_codes();
         let ifd_result = encoder::write_ifd(
             sink,
             ByteOrder::LittleEndian,
@@ -727,7 +790,7 @@ fn emit_cog<W: Write + Seek>(
             &planned.tags,
             offsets_tag_code,
             byte_counts_tag_code,
-            image.builder.checked_block_count()?,
+            image.checked_block_count()?,
         )?;
         ifd_results.push(ifd_result);
     }
@@ -735,7 +798,7 @@ fn emit_cog<W: Write + Seek>(
     for (index, image) in images.iter().enumerate() {
         let planned = &layout.images[index];
         let ifd_result = &ifd_results[index];
-        let (offsets_tag_code, byte_counts_tag_code) = image.builder.offset_tag_codes();
+        let (offsets_tag_code, byte_counts_tag_code) = image.offset_tag_codes();
 
         if image.blocks.len() == 1 {
             if let Some(off) = encoder::find_tag_value_offset(
@@ -975,6 +1038,7 @@ impl CogBuilder {
         let mut images = Vec::with_capacity(1 + overview_levels.len());
         images.push(CogImage {
             builder: self.inner.to_image_builder::<T>()?,
+            mask: None,
             blocks: Vec::new(),
             sub_ifd_count: if matches!(self.overview_storage, OverviewStorage::SubIfds) {
                 overview_levels.len()
@@ -985,10 +1049,72 @@ impl CogBuilder {
         for (index, &level) in overview_levels.iter().enumerate() {
             images.push(CogImage {
                 builder: self.overview_image_builder::<T>(level, tile_width, tile_height, index)?,
+                mask: None,
                 blocks: Vec::new(),
                 sub_ifd_count: 0,
             });
         }
+        Ok(images)
+    }
+
+    fn build_remux_cog_images<T: NumericSample>(
+        &self,
+        layers: &[RemuxLayer],
+        overview_levels: &[u32],
+        tile_width: u32,
+        tile_height: u32,
+    ) -> Result<Vec<CogImage>> {
+        let has_masks = layers
+            .iter()
+            .any(|layer| matches!(layer, RemuxLayer::Mask(_, _)));
+        let mut images = Vec::with_capacity(layers.len());
+        let mut rgb_index = 0usize;
+        let mut overview_index = 0usize;
+
+        for layer in layers {
+            match layer {
+                RemuxLayer::Rgb(_) => {
+                    if rgb_index == 0 {
+                        images.push(CogImage {
+                            builder: self.inner.to_image_builder::<T>()?,
+                            mask: None,
+                            blocks: Vec::new(),
+                            sub_ifd_count: if !has_masks
+                                && matches!(self.overview_storage, OverviewStorage::SubIfds)
+                            {
+                                overview_levels.len()
+                            } else {
+                                0
+                            },
+                        });
+                    } else {
+                        let level = overview_levels[overview_index];
+                        images.push(CogImage {
+                            builder: self.overview_image_builder::<T>(
+                                level,
+                                tile_width,
+                                tile_height,
+                                overview_index,
+                            )?,
+                            mask: None,
+                            blocks: Vec::new(),
+                            sub_ifd_count: 0,
+                        });
+                        overview_index += 1;
+                    }
+                    rgb_index += 1;
+                }
+                RemuxLayer::Mask(descriptor, _) => {
+                    images.push(CogImage {
+                        builder: ImageBuilder::new(descriptor.width, descriptor.height),
+                        mask: Some(descriptor.clone()),
+                        blocks: Vec::new(),
+                        sub_ifd_count: 0,
+                    });
+                }
+            }
+        }
+
         Ok(images)
     }
 
@@ -2536,6 +2662,40 @@ pub struct RemuxCompressedBlock {
     pub sparse: bool,
 }
 
+/// Metadata for remuxing a GDAL per-dataset transparency mask IFD.
+#[derive(Debug, Clone)]
+pub struct RemuxMaskDescriptor {
+    pub width: u32,
+    pub height: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub compression: Compression,
+    pub overview: bool,
+}
+
+/// One image layer in a remuxed COG output.
+#[derive(Debug, Clone)]
+pub enum RemuxLayer {
+    Rgb(Vec<RemuxCompressedBlock>),
+    Mask(RemuxMaskDescriptor, Vec<RemuxCompressedBlock>),
+}
+
+impl RemuxLayer {
+    pub fn rgb(blocks: Vec<RemuxCompressedBlock>) -> Self {
+        Self::Rgb(blocks)
+    }
+
+    pub fn mask(descriptor: RemuxMaskDescriptor, blocks: Vec<RemuxCompressedBlock>) -> Self {
+        Self::Mask(descriptor, blocks)
+    }
+
+    pub fn blocks(&self) -> &[RemuxCompressedBlock] {
+        match self {
+            Self::Rgb(blocks) | Self::Mask(_, blocks) => blocks,
+        }
+    }
+}
+
 /// Parameters for compressing one decoded tile during hybrid remux/crop.
 #[derive(Debug, Clone, Copy)]
 pub struct RemuxTileEncoding {
@@ -2581,10 +2741,23 @@ impl CogBuilder {
         path: P,
         layer_blocks: Vec<Vec<RemuxCompressedBlock>>,
     ) -> Result<()> {
+        let layers = layer_blocks
+            .into_iter()
+            .map(RemuxLayer::rgb)
+            .collect();
+        self.remux_layers_to_file::<T, P>(path, layers)
+    }
+
+    /// Write a remuxed COG with optional GDAL transparency mask IFDs.
+    pub fn remux_layers_to_file<T: NumericSample, P: AsRef<Path>>(
+        &self,
+        path: P,
+        layers: Vec<RemuxLayer>,
+    ) -> Result<()> {
         let file = File::create(path)?;
-        self.remux_to::<T, _>(
+        self.remux_layers_to::<T, _>(
             BufWriter::with_capacity(REMUX_OUTPUT_BUFFER_BYTES, file),
-            layer_blocks,
+            layers,
         )?;
         Ok(())
     }
@@ -2592,27 +2765,47 @@ impl CogBuilder {
     /// Write a remuxed COG to any `Write + Seek` target.
     pub fn remux_to<T: NumericSample, W: Write + Seek>(
         &self,
-        mut sink: W,
+        sink: W,
         layer_blocks: Vec<Vec<RemuxCompressedBlock>>,
     ) -> Result<W> {
+        let layers = layer_blocks
+            .into_iter()
+            .map(RemuxLayer::rgb)
+            .collect();
+        self.remux_layers_to::<T, W>(sink, layers)
+    }
+
+    /// Write a remuxed COG with optional GDAL transparency mask IFDs.
+    pub fn remux_layers_to<T: NumericSample, W: Write + Seek>(
+        &self,
+        mut sink: W,
+        layers: Vec<RemuxLayer>,
+    ) -> Result<W> {
         let overview_levels = self.normalized_overview_levels()?;
-        let expected_layers = 1 + overview_levels.len();
-        if layer_blocks.len() != expected_layers {
+        let rgb_layers = layers
+            .iter()
+            .filter(|layer| matches!(layer, RemuxLayer::Rgb(_)))
+            .count();
+        let expected_rgb = 1 + overview_levels.len();
+        if rgb_layers != expected_rgb {
             return Err(Error::Other(format!(
-                "remux expected {expected_layers} layers, got {}",
-                layer_blocks.len()
+                "remux expected {expected_rgb} RGB layers, got {rgb_layers}"
             )));
         }
 
         let tile_width = self.inner.tile_width.unwrap_or(256);
         let tile_height = self.inner.tile_height.unwrap_or(256);
-        let mut images = self.build_images::<T>(&overview_levels, tile_width, tile_height)?;
+        let mut images =
+            self.build_remux_cog_images::<T>(&layers, &overview_levels, tile_width, tile_height)?;
         let prefix = gdal_structural_metadata_bytes(self.inner.planar_configuration);
         let mut spool = BlockSpool::new()?;
         let byte_order = ByteOrder::LittleEndian;
 
-        for (image, blocks) in images.iter_mut().zip(layer_blocks) {
-            let expected = image.builder.checked_block_count()?;
+        for (image, layer) in images.iter_mut().zip(layers) {
+            let blocks = match layer {
+                RemuxLayer::Rgb(blocks) | RemuxLayer::Mask(_, blocks) => blocks,
+            };
+            let expected = image.checked_block_count()?;
             if blocks.len() != expected {
                 return Err(Error::Other(format!(
                     "remux layer expected {expected} blocks, got {}",
@@ -2660,6 +2853,7 @@ mod tests {
         let prefix = gdal_structural_metadata_bytes(tiff_core::PlanarConfiguration::Chunky);
         let images = vec![CogImage {
             builder: ImageBuilder::new(1, 1).sample_type::<u8>().tiles(16, 16),
+            mask: None,
             blocks: vec![CogBlockRecord {
                 spool_offset: u32::MAX as u64,
                 logical_offset_delta: 4,

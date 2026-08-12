@@ -11,6 +11,7 @@ use tiff_reader::TiffSample;
 use crate::cog::{overview_levels, tile_jobs, CogOutputOptions, TileJob};
 use crate::crop::WriteWindow;
 use crate::input::RasterProfile;
+use crate::progress::{ProgressTracker, StageBar};
 use crate::remux::{remux_encoded_layers, resolve_overview_read_source};
 
 pub fn convert_strip_to_remux_cog<T>(
@@ -21,6 +22,7 @@ pub fn convert_strip_to_remux_cog<T>(
     opts: &CogOutputOptions,
     window: Option<WriteWindow>,
     band_map: Option<&[usize]>,
+    show_progress: bool,
 ) -> Result<()>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -31,6 +33,9 @@ where
     let tile_size = opts.blocksize as usize;
     let levels = overview_levels(opts, width, height);
     let encoding = output_tile_encoding(opts, tile_size, out_bands as u16);
+    let progress = ProgressTracker::new(show_progress);
+    let encode_total = encode_row_group_total(width, height, tile_size, &levels);
+    let encode_bar = progress.stage("Encode tiles", encode_total);
 
     let layers = pool.install(|| {
         let mut layers = Vec::with_capacity(1 + levels.len());
@@ -43,6 +48,7 @@ where
             window,
             band_map,
             encoding,
+            Some(&encode_bar),
         )?);
 
         let mut parent_decoded: Option<Vec<(usize, usize, StripTile<T>)>> = None;
@@ -65,6 +71,7 @@ where
                         encoding,
                         opts,
                         chain_next,
+                        Some(&encode_bar),
                     )?
                 } else {
                     build_strip_overview_layer_with_cache::<T>(
@@ -79,6 +86,7 @@ where
                         encoding,
                         opts,
                         chain_next,
+                        Some(&encode_bar),
                     )?
                 }
             } else {
@@ -94,6 +102,7 @@ where
                     encoding,
                     opts,
                     chain_next,
+                    Some(&encode_bar),
                 )?
             };
 
@@ -107,7 +116,38 @@ where
         Ok::<_, anyhow::Error>(layers)
     })?;
 
-    remux_encoded_layers(profile, opts, layers, output, Some(levels), None)
+    encode_bar.done("done");
+    remux_encoded_layers(
+        input,
+        profile,
+        opts,
+        layers,
+        output,
+        Some(levels),
+        None,
+        show_progress,
+    )?;
+    progress.finish();
+    Ok(())
+}
+
+pub(crate) fn encode_row_group_total(
+    width: u32,
+    height: u32,
+    tile_size: usize,
+    levels: &[u32],
+) -> u64 {
+    let mut total = row_group_count(width, height, tile_size);
+    for &level in levels {
+        let ov_w = (width / level).max(1);
+        let ov_h = (height / level).max(1);
+        total += row_group_count(ov_w, ov_h, tile_size);
+    }
+    total
+}
+
+fn row_group_count(width: u32, height: u32, tile_size: usize) -> u64 {
+    (height as usize).div_ceil(tile_size) as u64
 }
 
 fn build_strip_base_layer<T>(
@@ -119,6 +159,7 @@ fn build_strip_base_layer<T>(
     window: Option<WriteWindow>,
     band_map: Option<&[usize]>,
     encoding: RemuxTileEncoding,
+    progress: Option<&StageBar>,
 ) -> Result<Vec<RemuxCompressedBlock>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -132,6 +173,7 @@ where
         window,
         band_map,
         encoding,
+        progress,
     )
 }
 
@@ -144,6 +186,7 @@ pub(crate) fn build_base_layer_from_rows<T>(
     window: Option<WriteWindow>,
     band_map: Option<&[usize]>,
     encoding: RemuxTileEncoding,
+    progress: Option<&StageBar>,
 ) -> Result<Vec<RemuxCompressedBlock>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -163,6 +206,9 @@ where
         .par_iter()
         .map(|(&row_off, jobs)| -> Result<Vec<(usize, RemuxCompressedBlock)>> {
             let batch = read_strip_row_batch::<T>(input, out_bands, window, band_map, row_off, jobs)?;
+            if let Some(bar) = progress {
+                bar.inc(1);
+            }
             batch
                 .into_iter()
                 .map(|(col_off, row_off, tile)| {
@@ -195,6 +241,7 @@ pub(crate) fn build_strip_overview_layer_with_cache<T>(
     encoding: RemuxTileEncoding,
     opts: &CogOutputOptions,
     cache_decoded: bool,
+    progress: Option<&StageBar>,
 ) -> Result<(Vec<RemuxCompressedBlock>, Vec<(usize, usize, StripTile<T>)>)>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -217,6 +264,9 @@ where
     let mut blocks = row_groups
         .par_iter()
         .map(|(&row_off, row_jobs)| {
+            if let Some(bar) = progress {
+                bar.inc(1);
+            }
             read_overview_row_batch::<T>(
                 input,
                 source_layer,
@@ -268,6 +318,7 @@ pub(crate) fn build_strip_overview_from_decoded<T>(
     encoding: RemuxTileEncoding,
     opts: &CogOutputOptions,
     cache_decoded: bool,
+    progress: Option<&StageBar>,
 ) -> Result<(Vec<RemuxCompressedBlock>, Vec<(usize, usize, StripTile<T>)>)>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -285,6 +336,9 @@ where
         .par_iter()
         .enumerate()
         .map(|(block_index, job)| {
+            if let Some(bar) = progress {
+                bar.inc(1);
+            }
             let tile = downsample_parent_tile::<T>(
                 &parent_map,
                 job,

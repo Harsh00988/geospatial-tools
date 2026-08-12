@@ -13,6 +13,18 @@ pub fn thread_pool(jobs: usize) -> Result<ThreadPool> {
     builder.build().context("failed to create thread pool")
 }
 
+/// Create parent directories for an output file path when missing.
+pub fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create output directory {}", parent.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Memory-map `path` for read-only access.
 ///
 /// The caller must not modify the file while it is mapped.

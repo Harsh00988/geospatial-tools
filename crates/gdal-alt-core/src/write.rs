@@ -13,6 +13,7 @@ use crate::crop::WriteWindow;
 use crate::input::RasterProfile;
 use crate::open::open_geotiff;
 use crate::progress::{ProgressTracker, StageBar};
+use crate::util::ensure_parent_dir;
 
 pub struct ConvertRequest<'a> {
     pub input: &'a Path,
@@ -26,6 +27,7 @@ pub struct ConvertRequest<'a> {
 
 pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -> Result<()> {
     request.opts.validate()?;
+    ensure_parent_dir(request.output)?;
     let input = open_geotiff(request.input, request.mmap)?;
     let mut profile = RasterProfile::from_geotiff(&input)?;
     if let Some(window) = &request.window {
@@ -43,6 +45,7 @@ pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -
         request.opts,
         request.window.as_ref(),
         request.bands.as_deref(),
+        request.show_progress,
     )? {
         return Ok(());
     }
@@ -115,6 +118,7 @@ where
         request.opts,
         request.window,
         request.bands.as_deref(),
+        request.show_progress,
     );
 }
 
@@ -135,6 +139,7 @@ where
         request.opts,
         request.window,
         request.bands.as_deref(),
+        request.show_progress,
     )
 }
 

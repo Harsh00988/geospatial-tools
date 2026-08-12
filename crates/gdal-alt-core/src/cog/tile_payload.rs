@@ -268,7 +268,10 @@ pub fn ifd_sample_format(ifd: &Ifd) -> Result<SampleFormat> {
     SampleFormat::from_code(code).ok_or_else(|| anyhow::anyhow!("unsupported sample format {code}"))
 }
 
-pub fn collect_remux_layers(input: &GeoTiffFile) -> Result<Vec<Vec<RemuxCompressedBlock>>> {
+pub fn collect_remux_layers(
+    input: &GeoTiffFile,
+    progress: Option<&crate::progress::StageBar>,
+) -> Result<Vec<Vec<RemuxCompressedBlock>>> {
     let tiff = input.tiff();
     let layer_count = 1 + input.overview_count();
     (0..layer_count)
@@ -279,7 +282,11 @@ pub fn collect_remux_layers(input: &GeoTiffFile) -> Result<Vec<Vec<RemuxCompress
             } else {
                 input.overview_ifd(layer_index - 1)?
             };
-            read_layer_blocks(tiff, ifd)
+            let blocks = read_layer_blocks(tiff, ifd)?;
+            if let Some(bar) = progress {
+                bar.inc(1);
+            }
+            Ok(blocks)
         })
         .collect()
 }

@@ -1,4 +1,4 @@
-use geotiff_writer::cog::CogBuilder;
+use geotiff_writer::cog::{CogBuilder, OverviewStorage};
 use geotiff_writer::GeoTiffBuilder;
 
 use super::grid::auto_overview_levels;
@@ -59,6 +59,21 @@ pub fn configure_cog_with_layer_sizes(
     CogBuilder::new(base)
         .resampling(opts.resampling.to_resampling())
         .subifd_overviews()
+        .overview_levels(levels)
+        .overview_layer_sizes(overview_sizes)
+}
+
+/// Like [`configure_cog_with_layer_sizes`] but uses a classic top-level IFD chain
+/// required for GDAL per-dataset transparency masks.
+pub fn configure_cog_with_layer_sizes_masked(
+    base: GeoTiffBuilder,
+    opts: &CogOutputOptions,
+    levels: Vec<u32>,
+    overview_sizes: Vec<(u32, u32)>,
+) -> CogBuilder {
+    CogBuilder::new(base)
+        .resampling(opts.resampling.to_resampling())
+        .overview_storage(OverviewStorage::TopLevelIfds)
         .overview_levels(levels)
         .overview_layer_sizes(overview_sizes)
 }

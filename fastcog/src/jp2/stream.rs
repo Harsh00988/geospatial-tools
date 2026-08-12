@@ -6,6 +6,7 @@ use gdal_alt_core::cog::{
 };
 use gdal_alt_core::input::{apply_georef, GeorefProfile};
 use gdal_alt_core::progress::{ProgressTracker, StageBar};
+use gdal_alt_core::util::ensure_parent_dir;
 use anyhow::{Context, Result};
 use geotiff_writer::cog::{pack_u8_planar_tile, LayerEncodePlan, PackedPlanarTile};
 use geotiff_writer::GeoTiffBuilder;
@@ -56,8 +57,11 @@ pub fn convert(
     let cog_builder = configure_cog_with_levels(base, &opts, levels.clone());
     let overview_sizes = layer_sizes(width, height, &levels);
 
-    let output = File::create(&args.output)
-        .with_context(|| format!("failed to create {}", args.output.display()))?;
+    let output = {
+        ensure_parent_dir(&args.output)?;
+        File::create(&args.output)
+            .with_context(|| format!("failed to create {}", args.output.display()))?
+    };
     let sink = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
     let mut stream = cog_builder.begin_planar_stream::<u8, _>(
         sink,
