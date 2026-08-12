@@ -2510,6 +2510,90 @@ fn spool_cog_block<T: NumericSample>(
     spool.append_segmented(&leader, &compressed, &trailer)
 }
 
+/// Pre-compressed COG tile payload (inner bytes between GDAL leader/trailer).
+#[derive(Debug, Clone)]
+pub struct RemuxCompressedBlock {
+    pub payload: Vec<u8>,
+    pub sparse: bool,
+}
+
+impl CogBuilder {
+    /// Write a COG by copying pre-compressed tile payloads (no decode/recompress).
+    ///
+    /// `layer_blocks` must contain one entry per image layer: base resolution first,
+    /// then each overview in the same order as `overview_levels`.
+    pub fn remux_to_file<T: NumericSample, P: AsRef<Path>>(
+        &self,
+        path: P,
+        layer_blocks: Vec<Vec<RemuxCompressedBlock>>,
+    ) -> Result<()> {
+        let file = File::create(path)?;
+        self.remux_to::<T, _>(BufWriter::new(file), layer_blocks)?;
+        Ok(())
+    }
+
+    /// Write a remuxed COG to any `Write + Seek` target.
+    pub fn remux_to<T: NumericSample, W: Write + Seek>(
+        &self,
+        mut sink: W,
+        layer_blocks: Vec<Vec<RemuxCompressedBlock>>,
+    ) -> Result<W> {
+        let overview_levels = self.normalized_overview_levels()?;
+        let expected_layers = 1 + overview_levels.len();
+        if layer_blocks.len() != expected_layers {
+            return Err(Error::Other(format!(
+                "remux expected {expected_layers} layers, got {}",
+                layer_blocks.len()
+            )));
+        }
+
+        let tile_width = self.inner.tile_width.unwrap_or(256);
+        let tile_height = self.inner.tile_height.unwrap_or(256);
+        let mut images = self.build_images::<T>(&overview_levels, tile_width, tile_height)?;
+        let prefix = gdal_structural_metadata_bytes(self.inner.planar_configuration);
+        let mut spool = BlockSpool::new()?;
+        let byte_order = ByteOrder::LittleEndian;
+
+        for (image, blocks) in images.iter_mut().zip(layer_blocks) {
+            let expected = image.builder.checked_block_count()?;
+            if blocks.len() != expected {
+                return Err(Error::Other(format!(
+                    "remux layer expected {expected} blocks, got {}",
+                    blocks.len()
+                )));
+            }
+
+            let mut records = Vec::with_capacity(blocks.len());
+            for (block_index, block) in blocks.into_iter().enumerate() {
+                if block.sparse || block.payload.is_empty() {
+                    records.push(CogBlockRecord {
+                        spool_offset: 0,
+                        logical_offset_delta: 0,
+                        logical_byte_count: 0,
+                        sparse: true,
+                    });
+                    continue;
+                }
+                let leader = gdal_block_leader(block.payload.len(), byte_order)?;
+                let trailer = gdal_block_trailer(&block.payload);
+                records.push(spool.append_segmented(&leader, &block.payload, &trailer)?);
+                let _ = block_index;
+            }
+            image.blocks = records;
+        }
+
+        let base_offset = sink.stream_position()?;
+        let layout = plan_cog_layout(
+            base_offset,
+            checked_len_u64(prefix.len(), "COG prefix")?,
+            self.inner.tiff_variant,
+            &images,
+        )?;
+        emit_cog(&mut sink, &prefix, &images, &layout, &mut spool)?;
+        Ok(sink)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

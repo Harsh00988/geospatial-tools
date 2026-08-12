@@ -1,10 +1,10 @@
 [package]
 name = "fastcog"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
 description = "Fast pure-Rust GeoTIFF and JP2 to COG converter"
 readme = "README.md"
-license = "MIT"
 keywords = ["geotiff", "cog", "gdal", "raster", "jp2"]
 categories = ["command-line-utilities", "science::geo"]
 
@@ -18,24 +18,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-geotiff-reader = { version = "0.8", features = ["rayon"] }
-geotiff-writer = { path = "vendor/geotiff-writer" }
-geotiff-core = "0.8"
-tiff-core = "0.8"
-tiff-reader = "0.8"
-ndarray = "0.17"
+gdal-alt-core = { path = "../crates/gdal-alt-core" }
+geotiff-writer = "0.8"
+memmap2 = "0.9"
 rayon = "1.10"
 anyhow = "1"
 jpeg2k = { version = "0.10", default-features = false, features = ["openjpeg-sys", "threads"] }
-memmap2 = "0.9"
-indicatif = "0.17"
-
-[patch.crates-io]
-geotiff-writer = { path = "vendor/geotiff-writer" }
-
-[profile.release]
-lto = true
-codegen-units = 1
-
-[profile.release.package."*"]
-opt-level = 3
+tiff-core = "0.8"

@@ -3,9 +3,7 @@ mod profile;
 mod stream;
 
 use crate::config::Args;
-use crate::geo;
-use crate::input::projected_georef;
-use crate::util;
+use gdal_alt_core::{geo, projected_georef, util};
 use anyhow::{Context, Result};
 
 pub fn convert(args: &Args, pool: &rayon::ThreadPool) -> Result<()> {

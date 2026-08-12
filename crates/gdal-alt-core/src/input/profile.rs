@@ -10,8 +10,7 @@ use tiff_core::{
 };
 use tiff_reader::Ifd;
 
-use crate::cog::{apply_compression, tiff_variant};
-use crate::config::Args;
+use crate::cog::{apply_compression, tiff_variant, CogOutputOptions};
 
 #[derive(Debug, Clone)]
 pub struct SampleLayout {
@@ -85,10 +84,10 @@ impl RasterProfile {
         })
     }
 
-    pub fn base_builder(&self, args: &Args) -> GeoTiffBuilder {
+    pub fn base_builder(&self, opts: &CogOutputOptions) -> GeoTiffBuilder {
         let mut builder = GeoTiffBuilder::new(self.width, self.height)
             .bands(self.bands)
-            .tile_size(args.blocksize, args.blocksize)
+            .tile_size(opts.blocksize, opts.blocksize)
             .photometric(self.photometric)
             .planar_configuration(self.planar_configuration)
             .tiff_variant(tiff_variant(
@@ -120,7 +119,27 @@ impl RasterProfile {
             builder = builder.nodata(nodata);
         }
 
-        apply_compression(builder, args)
+        apply_compression(builder, opts)
+    }
+
+    pub fn with_window(&self, window: &crate::crop::WriteWindow) -> Self {
+        let mut profile = self.clone();
+        profile.width = window.width as u32;
+        profile.height = window.height as u32;
+        if let Some(affine) = profile.georef.affine.as_mut() {
+            *affine = crate::crop::shift_transform(affine, window.col_off, window.row_off);
+        }
+        profile
+    }
+
+    pub fn with_band_subset(&self, bands: &[usize]) -> Self {
+        let mut profile = self.clone();
+        profile.bands = bands.len() as u32;
+        if profile.bands == 3 {
+            profile.photometric = PhotometricInterpretation::Rgb;
+        }
+        profile.extra_samples.clear();
+        profile
     }
 }
 

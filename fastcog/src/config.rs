@@ -1,7 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use geotiff_writer::cog::Resampling;
-use geotiff_writer::Compression;
+use gdal_alt_core::{CogOutputOptions, CompressionChoice, ResamplingChoice};
 use std::path::PathBuf;
 
 /// Convert rasters to Cloud Optimized GeoTIFF (COG) format.
@@ -21,16 +20,16 @@ pub struct Args {
     pub blocksize: u32,
 
     /// Compression algorithm
-    #[arg(short = 'c', long, value_enum, default_value_t = CompressionChoice::Deflate)]
-    pub compress: CompressionChoice,
+    #[arg(short = 'c', long, value_enum, default_value_t = CompressionArg::Deflate)]
+    pub compress: CompressionArg,
 
     /// Deflate compression level (0-9)
     #[arg(long, default_value_t = 6)]
     pub deflate_level: u32,
 
     /// Overview resampling method
-    #[arg(short = 'r', long, value_enum, default_value_t = ResamplingChoice::Average)]
-    pub resampling: ResamplingChoice,
+    #[arg(short = 'r', long, value_enum, default_value_t = ResamplingArg::Average)]
+    pub resampling: ResamplingArg,
 
     /// Explicit overview factors (e.g. 2 4 8). Auto-computed when omitted.
     #[arg(short = 'o', long, value_delimiter = ' ')]
@@ -55,28 +54,36 @@ pub struct Args {
 
 impl Args {
     pub fn validate(&self) -> Result<()> {
-        if !self.blocksize.is_multiple_of(16) {
-            bail!(
-                "blocksize must be a multiple of 16 (got {})",
-                self.blocksize
-            );
-        }
-        if self.deflate_level > 9 {
-            bail!(
-                "deflate-level must be between 0 and 9 (got {})",
-                self.deflate_level
-            );
-        }
-        Ok(())
+        self.cog_options().validate()
     }
 
     pub fn show_progress(&self) -> bool {
         !self.quiet && std::io::IsTerminal::is_terminal(&std::io::stderr())
     }
+
+    pub fn cog_options(&self) -> CogOutputOptions {
+        CogOutputOptions {
+            blocksize: self.blocksize,
+            compression: match self.compress {
+                CompressionArg::None => CompressionChoice::None,
+                CompressionArg::Lzw => CompressionChoice::Lzw,
+                CompressionArg::Deflate => CompressionChoice::Deflate,
+                CompressionArg::Zstd => CompressionChoice::Zstd,
+                CompressionArg::Jpeg => CompressionChoice::Jpeg,
+            },
+            deflate_level: self.deflate_level,
+            resampling: match self.resampling {
+                ResamplingArg::Nearest => ResamplingChoice::Nearest,
+                ResamplingArg::Average => ResamplingChoice::Average,
+            },
+            overview_levels: self.overviews.clone(),
+            no_overviews: self.no_overviews,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum CompressionChoice {
+pub enum CompressionArg {
     None,
     Lzw,
     Deflate,
@@ -84,29 +91,8 @@ pub enum CompressionChoice {
     Jpeg,
 }
 
-impl CompressionChoice {
-    pub fn to_compression(self) -> Compression {
-        match self {
-            Self::None => Compression::None,
-            Self::Lzw => Compression::Lzw,
-            Self::Deflate => Compression::Deflate,
-            Self::Zstd => Compression::Zstd,
-            Self::Jpeg => Compression::Jpeg,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum ResamplingChoice {
+pub enum ResamplingArg {
     Nearest,
     Average,
-}
-
-impl ResamplingChoice {
-    pub fn to_resampling(self) -> Resampling {
-        match self {
-            Self::Nearest => Resampling::NearestNeighbor,
-            Self::Average => Resampling::Average,
-        }
-    }
 }

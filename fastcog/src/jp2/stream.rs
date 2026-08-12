@@ -1,11 +1,11 @@
-use crate::cog::{
-    apply_compression, configure_cog_with_levels, layer_sizes, overview_levels, tiff_variant,
-};
 use crate::config::Args;
-use crate::input::{apply_georef, GeorefProfile};
 use crate::jp2::decode::{self, Region, RgbPlanes};
 use crate::jp2::profile::Jp2Raster;
-use crate::progress::{ProgressTracker, StageBar};
+use gdal_alt_core::cog::{
+    apply_compression, configure_cog_with_levels, layer_sizes, overview_levels, tiff_variant,
+};
+use gdal_alt_core::input::{apply_georef, GeorefProfile};
+use gdal_alt_core::progress::{ProgressTracker, StageBar};
 use anyhow::{Context, Result};
 use geotiff_writer::cog::{pack_u8_planar_tile, LayerEncodePlan, PackedPlanarTile};
 use geotiff_writer::GeoTiffBuilder;
@@ -27,8 +27,9 @@ pub fn convert(
 ) -> Result<()> {
     let width = raster.width;
     let height = raster.height;
-    let levels = overview_levels(args, width, height);
-    let tile_size = args.blocksize;
+    let opts = args.cog_options();
+    let levels = overview_levels(&opts, width, height);
+    let tile_size = opts.blocksize;
 
     let base = apply_georef(
         apply_compression(
@@ -43,12 +44,12 @@ pub fn convert(
                     raster.bands,
                     u16::from(raster.bits_per_sample),
                 )),
-            args,
+            &opts,
         ),
         &georef,
     );
 
-    let cog_builder = configure_cog_with_levels(base, args, levels.clone());
+    let cog_builder = configure_cog_with_levels(base, &opts, levels.clone());
     let overview_sizes = layer_sizes(width, height, &levels);
 
     let output = File::create(&args.output)
