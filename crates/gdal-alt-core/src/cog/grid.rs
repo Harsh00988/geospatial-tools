@@ -35,12 +35,11 @@ pub fn tile_jobs(width: u32, height: u32, tile_size: u32) -> Vec<TileJob> {
 pub fn auto_overview_levels(width: u32, height: u32, blocksize: u32) -> Vec<u32> {
     let mut levels = Vec::new();
     let mut factor = 2u32;
-    loop {
-        let w = width / factor;
-        let h = height / factor;
-        if w < blocksize && h < blocksize {
-            break;
-        }
+    let mut w = width;
+    let mut h = height;
+    while w.max(h) > blocksize {
+        w /= 2;
+        h /= 2;
         levels.push(factor);
         factor = factor.saturating_mul(2);
         if factor > 1024 {
@@ -50,15 +49,16 @@ pub fn auto_overview_levels(width: u32, height: u32, blocksize: u32) -> Vec<u32>
     levels
 }
 
+pub fn overview_dimensions(width: u32, height: u32, level: u32) -> (u32, u32) {
+    ((width / level).max(1), (height / level).max(1))
+}
+
 pub fn overview_sizes(width: u32, height: u32, levels: &[u32]) -> Vec<(usize, usize)> {
     levels
         .iter()
         .map(|&level| {
-            let level = level as usize;
-            (
-                (width as usize).div_ceil(level),
-                (height as usize).div_ceil(level),
-            )
+            let (w, h) = overview_dimensions(width, height, level);
+            (w as usize, h as usize)
         })
         .collect()
 }

@@ -9,7 +9,7 @@ use tiff_reader::Ifd;
 use crate::cog::tile_payload::{
     collect_remux_layers, ifd_planar, ifd_sample_format, input_compression, read_layer_blocks,
 };
-use crate::cog::{configure_cog, overview_levels, CogOutputOptions};
+use crate::cog::{configure_cog, configure_cog_with_layer_sizes, auto_overview_levels, overview_levels, CogOutputOptions};
 use crate::crop::WriteWindow;
 use crate::input::RasterProfile;
 use crate::open::open_geotiff;
@@ -40,6 +40,12 @@ pub fn try_remux_cog(
     if let Some(bands) = bands {
         if is_identity_bands(bands, input.band_count() as usize) {
             if compression_matches(opts, input_compression(input.tiff().ifd(input.base_ifd_index())?)) {
+                if overview_tiles_compatible(input, opts.blocksize)? {
+                    return remux_identity(input, output, profile, opts);
+                }
+                if input.overview_count() > 0 {
+                    return try_transcode_remux(input, output, profile, opts);
+                }
                 return remux_identity(input, output, profile, opts);
             }
             return try_transcode_remux(input, output, profile, opts);
@@ -51,6 +57,12 @@ pub fn try_remux_cog(
     }
 
     if compression_matches(opts, input_compression(input.tiff().ifd(input.base_ifd_index())?)) {
+        if overview_tiles_compatible(input, opts.blocksize)? {
+            return remux_identity(input, output, profile, opts);
+        }
+        if input.overview_count() > 0 {
+            return try_transcode_remux(input, output, profile, opts);
+        }
         return remux_identity(input, output, profile, opts);
     }
 
@@ -137,8 +149,42 @@ fn try_transcode_remux(
         _ => return Ok(false),
     };
 
-    remux_encoded_layers(profile, opts, output_layers, output, Some(levels))?;
+    remux_encoded_layers(
+        profile,
+        opts,
+        output_layers,
+        output,
+        Some(levels),
+        Some(input_overview_layer_sizes(input)?),
+    )?;
     Ok(true)
+}
+
+pub(crate) fn best_source_overview(source_factors: &[u32], target_level: u32) -> Option<(usize, u32)> {
+    source_factors
+        .iter()
+        .enumerate()
+        .filter(|(_, factor)| **factor >= target_level)
+        .min_by_key(|(_, factor)| *factor)
+        .map(|(index, &factor)| (index, factor))
+}
+
+/// Resolve which source pyramid layer to read when building a target overview level.
+/// Returns `(layer_index, source_factor, downsample)` where `layer_index` is 0 for base
+/// and 1+ for overview IFDs, and `downsample` is the extra reduction after the read.
+pub(crate) fn resolve_overview_read_source(
+    input: &GeoTiffFile,
+    level: u32,
+) -> Result<(usize, u32, usize)> {
+    let factors = input_overview_levels(input)?;
+    if let Some(index) = factors.iter().position(|&factor| factor == level) {
+        return Ok((index + 1, level, 1));
+    }
+    if let Some((index, factor)) = best_source_overview(&factors, level) {
+        let downsample = (factor / level).max(1) as usize;
+        return Ok((index + 1, factor, downsample));
+    }
+    Ok((0, 1, level as usize))
 }
 
 pub(crate) fn input_overview_levels(input: &GeoTiffFile) -> Result<Vec<u32>> {
@@ -147,10 +193,19 @@ pub(crate) fn input_overview_levels(input: &GeoTiffFile) -> Result<Vec<u32>> {
     for index in 0..input.overview_count() {
         let ov = input.overview_ifd(index)?;
         let ov_w = ov.width().max(1);
-        let factor = base_w.div_ceil(ov_w).max(1);
+        let factor = (base_w / ov_w).max(1);
         levels.push(factor);
     }
     Ok(levels)
+}
+
+pub(crate) fn input_overview_layer_sizes(input: &GeoTiffFile) -> Result<Vec<(u32, u32)>> {
+    let mut sizes = Vec::with_capacity(input.overview_count());
+    for index in 0..input.overview_count() {
+        let ov = input.overview_ifd(index)?;
+        sizes.push((ov.width(), ov.height()));
+    }
+    Ok(sizes)
 }
 
 fn collect_all_layers(input: &GeoTiffFile) -> Result<Vec<Vec<RemuxCompressedBlock>>> {
@@ -170,7 +225,8 @@ fn remux_identity(
 ) -> Result<bool> {
     let layers = collect_all_layers(input)?;
     let levels = input_overview_levels(input)?;
-    remux_with_layers(profile, opts, layers, output, Some(levels))?;
+    let sizes = input_overview_layer_sizes(input)?;
+    remux_with_layers(profile, opts, layers, output, Some(levels), Some(sizes))?;
     Ok(true)
 }
 
@@ -195,6 +251,7 @@ fn remux_planar_band_permute(
         output_layers,
         output,
         Some(input_overview_levels(input)?),
+        Some(input_overview_layer_sizes(input)?),
     )?;
     Ok(true)
 }
@@ -280,7 +337,7 @@ fn try_remux_crop(
         _ => return Ok(false),
     };
 
-    remux_with_layers(profile, opts, output_layers, output, Some(output_levels))?;
+    remux_with_layers(profile, opts, output_layers, output, Some(output_levels), None)?;
     Ok(true)
 }
 
@@ -330,6 +387,7 @@ fn remux_chunky_band_permute(
         output_layers,
         output,
         Some(input_overview_levels(input)?),
+        Some(input_overview_layer_sizes(input)?),
     )?;
     Ok(true)
 }
@@ -342,14 +400,36 @@ fn compression_matches(opts: &CogOutputOptions, input: Compression) -> bool {
     opts.compression.to_compression() == input
 }
 
+fn overview_tiles_compatible(input: &GeoTiffFile, blocksize: u32) -> Result<bool> {
+    for index in 0..input.overview_count() {
+        let ov = input.overview_ifd(index)?;
+        let (tile_w, tile_h) = match (ov.tile_width(), ov.tile_height()) {
+            (Some(w), Some(h)) => (w, h),
+            _ => return Ok(false),
+        };
+        if tile_w != blocksize || tile_h != blocksize {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn remux_with_layers(
     profile: &RasterProfile,
     opts: &CogOutputOptions,
     layers: Vec<Vec<RemuxCompressedBlock>>,
     output: &Path,
     overview_levels: Option<Vec<u32>>,
+    overview_sizes: Option<Vec<(u32, u32)>>,
 ) -> Result<()> {
-    remux_encoded_layers(profile, opts, layers, output, overview_levels)
+    remux_encoded_layers(
+        profile,
+        opts,
+        layers,
+        output,
+        overview_levels,
+        overview_sizes,
+    )
 }
 
 pub(crate) fn remux_encoded_layers(
@@ -357,12 +437,36 @@ pub(crate) fn remux_encoded_layers(
     opts: &CogOutputOptions,
     layers: Vec<Vec<RemuxCompressedBlock>>,
     output: &Path,
-    overview_levels: Option<Vec<u32>>,
+    mut overview_levels: Option<Vec<u32>>,
+    mut overview_sizes: Option<Vec<(u32, u32)>>,
 ) -> Result<()> {
-    let cog = if let Some(levels) = overview_levels {
-        crate::cog::configure_cog_with_levels(profile.base_builder(opts), opts, levels)
-    } else {
-        configure_cog(profile.base_builder(opts), opts, profile.width, profile.height)
+    let target_overviews = layers.len().saturating_sub(1);
+    if let Some(levels) = overview_levels.as_mut() {
+        levels.truncate(target_overviews);
+    }
+    if let Some(sizes) = overview_sizes.as_mut() {
+        sizes.truncate(target_overviews);
+    }
+    if overview_levels.is_none() && target_overviews > 0 {
+        overview_levels = Some(
+            auto_overview_levels(profile.width, profile.height, opts.blocksize)
+                .into_iter()
+                .take(target_overviews)
+                .collect(),
+        );
+    }
+
+    let cog = match (overview_levels, overview_sizes) {
+        (Some(levels), Some(sizes)) => configure_cog_with_layer_sizes(
+            profile.base_builder(opts),
+            opts,
+            levels,
+            sizes,
+        ),
+        (Some(levels), None) => {
+            crate::cog::configure_cog_with_levels(profile.base_builder(opts), opts, levels)
+        }
+        _ => configure_cog(profile.base_builder(opts), opts, profile.width, profile.height),
     };
     match (profile.sample.bits_per_sample, profile.sample.sample_format) {
         (8, SampleFormat::Uint) => cog.remux_to_file::<u8, _>(output, layers),

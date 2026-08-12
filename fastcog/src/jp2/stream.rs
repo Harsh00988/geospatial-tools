@@ -28,7 +28,11 @@ pub fn convert(
     let width = raster.width;
     let height = raster.height;
     let opts = args.cog_options();
-    let levels = overview_levels(&opts, width, height);
+    // OpenJPEG supports reduce factors 1..=4 (overview levels 2, 4, 8, 16).
+    let levels: Vec<u32> = overview_levels(&opts, width, height)
+        .into_iter()
+        .take_while(|&level| level.trailing_zeros() <= 4)
+        .collect();
     let tile_size = opts.blocksize;
 
     let base = apply_georef(
@@ -76,45 +80,32 @@ pub fn convert(
     };
     let write_bar = progress.stage("Write COG", 1 + levels.len() as u64);
 
-    let (base_packed, overview_packed) = pool.install(
-        || -> Result<(Vec<PackedPlanarTile>, Vec<Vec<PackedPlanarTile>>)> {
-            std::thread::scope(|scope| {
-                let overview_handle = if levels_for_overviews.is_empty() {
-                    None
-                } else {
-                    let levels = levels_for_overviews.clone();
-                    let bar = overview_bar.clone();
-                    Some(scope.spawn(move || -> Result<Vec<Vec<PackedPlanarTile>>> {
-                        levels
-                            .par_iter()
-                            .map(|&level| {
-                                let packed =
-                                    pack_overview(mmap_overviews.as_ref(), level, encode_plan)?;
-                                bar.inc(1);
-                                Ok(packed)
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    }))
-                };
+    // OpenJPEG is not safe for concurrent region decodes on one codestream, but each
+    // reduce-level overview decode is an independent session and can run in parallel.
+    let overview_packed = if levels_for_overviews.is_empty() {
+        Vec::new()
+    } else {
+        pool.install(|| {
+            levels_for_overviews
+                .par_iter()
+                .map(|&level| {
+                    let packed = pack_overview(mmap_overviews.as_ref(), level, encode_plan)?;
+                    overview_bar.inc(1);
+                    Ok(packed)
+                })
+                .collect::<Result<Vec<_>>>()
+        })?
+    };
+    if !levels_for_overviews.is_empty() {
+        overview_bar.done("done");
+    }
 
-                let ctx = TileGrid::new(width, height, encode_plan);
-                let base_packed = encode_base_layer(mmap_base.as_ref(), &ctx, decode_bar.clone())?;
-                decode_bar.done("done");
-
-                let overview_packed = if let Some(handle) = overview_handle {
-                    let packed = handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("overview worker panicked"))??;
-                    overview_bar.done("done");
-                    packed
-                } else {
-                    Vec::new()
-                };
-
-                Ok((base_packed, overview_packed))
-            })
-        },
-    )?;
+    let base_packed = pool.install(|| -> Result<Vec<PackedPlanarTile>> {
+        let ctx = TileGrid::new(width, height, encode_plan);
+        let base_packed = encode_base_layer(mmap_base.as_ref(), &ctx, decode_bar.clone())?;
+        decode_bar.done("done");
+        Ok(base_packed)
+    })?;
 
     stream.commit_layer(0, base_packed)?;
     write_bar.inc(1);

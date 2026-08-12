@@ -50,4 +50,17 @@ pub fn configure_cog_with_levels(
         .overview_levels(levels)
 }
 
+pub fn configure_cog_with_layer_sizes(
+    base: GeoTiffBuilder,
+    opts: &CogOutputOptions,
+    levels: Vec<u32>,
+    overview_sizes: Vec<(u32, u32)>,
+) -> CogBuilder {
+    CogBuilder::new(base)
+        .resampling(opts.resampling.to_resampling())
+        .subifd_overviews()
+        .overview_levels(levels)
+        .overview_layer_sizes(overview_sizes)
+}
+
 pub use super::grid::overview_sizes as layer_sizes;

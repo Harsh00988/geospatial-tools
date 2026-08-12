@@ -270,13 +270,16 @@ pub fn ifd_sample_format(ifd: &Ifd) -> Result<SampleFormat> {
 
 pub fn collect_remux_layers(input: &GeoTiffFile) -> Result<Vec<Vec<RemuxCompressedBlock>>> {
     let tiff = input.tiff();
-    let mut layers = Vec::new();
-    layers.push(read_layer_blocks(
-        tiff,
-        tiff.ifd(input.base_ifd_index())?,
-    )?);
-    for index in 0..input.overview_count() {
-        layers.push(read_layer_blocks(tiff, input.overview_ifd(index)?)?);
-    }
-    Ok(layers)
+    let layer_count = 1 + input.overview_count();
+    (0..layer_count)
+        .into_par_iter()
+        .map(|layer_index| {
+            let ifd = if layer_index == 0 {
+                tiff.ifd(input.base_ifd_index())?
+            } else {
+                input.overview_ifd(layer_index - 1)?
+            };
+            read_layer_blocks(tiff, ifd)
+        })
+        .collect()
 }

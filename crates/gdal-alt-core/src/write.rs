@@ -107,50 +107,15 @@ where
         return convert_strip_remux::<T>(pool, request, input, profile);
     }
 
-    let width = profile.width;
-    let height = profile.height;
-    let out_bands = profile.bands as usize;
-    let tile_size = request.opts.blocksize;
-    let window = request.window;
-    let band_map = request.bands.clone();
-
-    let cog_builder = configure_cog(profile.base_builder(request.opts), request.opts, width, height);
-    let mut writer = cog_builder
-        .tile_writer_file::<T, _>(request.output)
-        .with_context(|| format!("failed to create COG writer for {}", request.output.display()))?;
-
-    let tiles = tile_jobs(width, height, tile_size);
-    let progress = ProgressTracker::new(request.show_progress);
-    let read_bar = progress.stage("Read tiles", tiles.len() as u64);
-    let write_bar = progress.stage("Write COG", tiles.len() as u64 + 1);
-
-    let mut decoded = pool.install(|| {
-        tiles
-            .par_iter()
-            .map(|job| read_tile(input, out_bands, window, band_map.as_deref(), job, &read_bar))
-            .collect::<Result<Vec<_>>>()
-    })?;
-    read_bar.done("done");
-
-    decoded.sort_by_key(|(col, row, _)| (*row, *col));
-
-    for (col_off, row_off, tile) in decoded {
-        match tile {
-            TileWindow::Single(data) => writer
-                .write_tile(col_off, row_off, &data.view())
-                .context("failed to write COG tile")?,
-            TileWindow::Multi(data) => writer
-                .write_tile_3d(col_off, row_off, &data.view())
-                .context("failed to write COG tile")?,
-        }
-        write_bar.inc(1);
-    }
-
-    writer.finish().context("failed to finalize COG")?;
-    write_bar.inc(1);
-    write_bar.done("done");
-    progress.finish();
-    Ok(())
+    return crate::tiled_encode::convert_tiled_to_remux_cog::<T>(
+        pool,
+        input,
+        request.output,
+        profile,
+        request.opts,
+        request.window,
+        request.bands.as_deref(),
+    );
 }
 
 fn convert_strip_remux<T>(

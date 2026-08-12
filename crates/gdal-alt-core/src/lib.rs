@@ -10,6 +10,7 @@ pub mod chunky_permute;
 pub mod hybrid_crop;
 pub mod remux;
 pub mod strip_encode;
+pub mod tiled_encode;
 pub mod transcode;
 pub mod util;
 pub mod validate;

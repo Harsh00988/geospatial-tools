@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use tiff_core::Predictor;
 use tiff_reader::{Ifd, TiffSample};
 
-use crate::cog::{overview_levels, tile_jobs, CogOutputOptions, TileJob};
+use crate::cog::{tile_jobs, CogOutputOptions, TileJob};
 use crate::input::RasterProfile;
 use crate::remux::layer_ifd;
 
@@ -22,8 +22,7 @@ where
     let _ = profile;
     let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
     let tile_size = base_ifd.tile_width().unwrap_or(opts.blocksize) as usize;
-    let levels = overview_levels(opts, profile.width, profile.height);
-    let layer_count = 1 + levels.len();
+    let layer_count = 1 + input.overview_count();
 
     (0..layer_count)
         .into_par_iter()

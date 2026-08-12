@@ -18,6 +18,8 @@ use std::path::Path;
 
 use ndarray::{ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
+
+const REMUX_OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 use tempfile::tempfile;
 use tiff_core::{ByteOrder, Compression, Predictor, Tag, TagValue, TAG_SUB_IFDS};
 use tiff_writer::{encoder, ImageBuilder, TiffVariant};
@@ -489,6 +491,8 @@ impl<T: NumericSample> OverviewSampleSource<T> for ArrayTileSource<'_, T> {
 pub struct CogBuilder {
     inner: GeoTiffBuilder,
     overview_levels: Vec<u32>,
+    /// Explicit overview dimensions in the same order as `overview_levels`.
+    overview_layer_sizes: Option<Vec<(u32, u32)>>,
     resampling: Resampling,
     overview_storage: OverviewStorage,
 }
@@ -527,7 +531,6 @@ fn compress_cog_block<T: NumericSample>(
         .map_err(Into::into)
     } else if matches!(encoding.compression, Compression::Deflate)
         && encoding.predictor == Predictor::None
-        && std::mem::size_of::<T>() == 1
     {
         let level = encoding.deflate_level.unwrap_or(6).min(12) as u8;
         let bytes = unsafe {
@@ -863,6 +866,7 @@ impl CogBuilder {
         Self {
             inner: builder,
             overview_levels: vec![2, 4, 8],
+            overview_layer_sizes: None,
             resampling: Resampling::NearestNeighbor,
             overview_storage: OverviewStorage::TopLevelIfds,
         }
@@ -871,6 +875,13 @@ impl CogBuilder {
     /// Set overview levels (e.g., [2, 4, 8] for 1/2, 1/4, 1/8 resolution).
     pub fn overview_levels(mut self, levels: Vec<u32>) -> Self {
         self.overview_levels = levels;
+        self.overview_layer_sizes = None;
+        self
+    }
+
+    /// Set explicit overview dimensions for remux/copy workflows.
+    pub fn overview_layer_sizes(mut self, sizes: Vec<(u32, u32)>) -> Self {
+        self.overview_layer_sizes = Some(sizes);
         self
     }
 
@@ -907,9 +918,23 @@ impl CogBuilder {
         level: u32,
         tile_width: u32,
         tile_height: u32,
+        overview_index: usize,
     ) -> Result<ImageBuilder> {
-        let ovr_w = (self.inner.width as usize).div_ceil(level as usize) as u32;
-        let ovr_h = (self.inner.height as usize).div_ceil(level as usize) as u32;
+        let (ovr_w, ovr_h) = if let Some(sizes) = &self.overview_layer_sizes {
+            sizes
+                .get(overview_index)
+                .copied()
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "missing explicit overview size for overview index {overview_index}"
+                    ))
+                })?
+        } else {
+            (
+                (self.inner.width / level).max(1),
+                (self.inner.height / level).max(1),
+            )
+        };
 
         let overview_builder = self.inner.with_overview_georeferencing(level);
         let mut builder = overview_builder
@@ -934,8 +959,8 @@ impl CogBuilder {
         tile_height: u32,
     ) -> Result<()> {
         self.inner.to_image_builder::<T>()?.validate()?;
-        for &level in overview_levels {
-            self.overview_image_builder::<T>(level, tile_width, tile_height)?
+        for (index, &level) in overview_levels.iter().enumerate() {
+            self.overview_image_builder::<T>(level, tile_width, tile_height, index)?
                 .validate()?;
         }
         Ok(())
@@ -957,9 +982,9 @@ impl CogBuilder {
                 0
             },
         });
-        for &level in overview_levels {
+        for (index, &level) in overview_levels.iter().enumerate() {
             images.push(CogImage {
-                builder: self.overview_image_builder::<T>(level, tile_width, tile_height)?,
+                builder: self.overview_image_builder::<T>(level, tile_width, tile_height, index)?,
                 blocks: Vec::new(),
                 sub_ifd_count: 0,
             });
@@ -1041,8 +1066,8 @@ impl CogBuilder {
 
         for (idx, &level) in overview_levels.iter().enumerate() {
             let level = level as usize;
-            let expected_h = height.div_ceil(level);
-            let expected_w = width.div_ceil(level);
+            let expected_h = (height / level).max(1);
+            let expected_w = (width / level).max(1);
             let (oh, ow, ob) = overviews[idx].dim();
             if oh != expected_h || ow != expected_w || ob != bands {
                 return Err(Error::InvalidConfig(format!(
@@ -1132,8 +1157,8 @@ impl CogBuilder {
 
         for (idx, &level) in overview_levels.iter().enumerate() {
             let level = level as usize;
-            let expected_h = height.div_ceil(level);
-            let expected_w = width.div_ceil(level);
+            let expected_h = (height / level).max(1);
+            let expected_w = (width / level).max(1);
             let (ow, oh, oplanes) = &overviews[idx];
             if *oh != expected_h || *ow != expected_w {
                 return Err(Error::InvalidConfig(format!(
@@ -1227,8 +1252,8 @@ impl CogBuilder {
 
         for (idx, &level) in overview_levels.iter().enumerate() {
             let level = level as usize;
-            let expected_h = height.div_ceil(level);
-            let expected_w = width.div_ceil(level);
+            let expected_h = (height / level).max(1);
+            let expected_w = (width / level).max(1);
             let (ow, oh) = overview_sizes[idx];
             if oh != expected_h || ow != expected_w {
                 return Err(Error::InvalidConfig(format!(
@@ -2557,7 +2582,10 @@ impl CogBuilder {
         layer_blocks: Vec<Vec<RemuxCompressedBlock>>,
     ) -> Result<()> {
         let file = File::create(path)?;
-        self.remux_to::<T, _>(BufWriter::new(file), layer_blocks)?;
+        self.remux_to::<T, _>(
+            BufWriter::with_capacity(REMUX_OUTPUT_BUFFER_BYTES, file),
+            layer_blocks,
+        )?;
         Ok(())
     }
 

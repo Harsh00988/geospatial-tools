@@ -10,6 +10,7 @@ pub fn run(args: &Args) -> Result<()> {
     let pool = util::thread_pool(args.jobs)?;
     let started = std::time::Instant::now();
     let opts = args.cog_options();
+    let mmap = args.mmap || auto_mmap_input(&args.input);
 
     match detect(&args.input) {
         InputFormat::Jp2 => jp2::convert(args, &pool)?,
@@ -19,7 +20,7 @@ pub fn run(args: &Args) -> Result<()> {
                 input: &args.input,
                 output: &args.output,
                 opts: &opts,
-                mmap: args.mmap,
+                mmap,
                 show_progress: args.show_progress(),
                 window: None,
                 bands: None,
@@ -34,4 +35,12 @@ pub fn run(args: &Args) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Memory-map large local GeoTIFF inputs to reduce read syscall overhead.
+fn auto_mmap_input(path: &std::path::Path) -> bool {
+    const THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() >= THRESHOLD_BYTES)
+        .unwrap_or(false)
 }
