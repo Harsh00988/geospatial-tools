@@ -7,8 +7,7 @@ use tiff_core::{Compression, PlanarConfiguration, SampleFormat};
 use tiff_reader::Ifd;
 
 use crate::cog::tile_payload::{
-    collect_remux_layers, ifd_planar, ifd_predictor, ifd_sample_format, input_compression,
-    read_layer_blocks,
+    collect_remux_layers, ifd_planar, ifd_sample_format, input_compression, read_layer_blocks,
 };
 use crate::cog::{configure_cog, overview_levels, CogOutputOptions};
 use crate::crop::WriteWindow;
@@ -30,7 +29,7 @@ pub fn try_remux_cog(
     window: Option<&WriteWindow>,
     bands: Option<&[usize]>,
 ) -> Result<bool> {
-    if !compatible_cog_source(input, profile, opts)? {
+    if !layout_compatible(input, profile, opts)? {
         return Ok(false);
     }
 
@@ -40,18 +39,25 @@ pub fn try_remux_cog(
 
     if let Some(bands) = bands {
         if is_identity_bands(bands, input.band_count() as usize) {
-            return remux_identity(input, output, profile, opts);
+            if compression_matches(opts, input_compression(input.tiff().ifd(input.base_ifd_index())?)) {
+                return remux_identity(input, output, profile, opts);
+            }
+            return try_transcode_remux(input, output, profile, opts);
         }
         if ifd_planar(input.tiff().ifd(input.base_ifd_index())?) == PlanarConfiguration::Planar {
             return remux_planar_band_permute(input, output, profile, opts, bands);
         }
-        return Ok(false);
+        return remux_chunky_band_permute(input, output, profile, opts, bands);
     }
 
-    remux_identity(input, output, profile, opts)
+    if compression_matches(opts, input_compression(input.tiff().ifd(input.base_ifd_index())?)) {
+        return remux_identity(input, output, profile, opts);
+    }
+
+    try_transcode_remux(input, output, profile, opts)
 }
 
-fn compatible_cog_source(
+fn layout_compatible(
     input: &GeoTiffFile,
     profile: &RasterProfile,
     opts: &CogOutputOptions,
@@ -69,10 +75,6 @@ fn compatible_cog_source(
         return Ok(false);
     }
 
-    if !compression_matches(opts, input_compression(base_ifd)) {
-        return Ok(false);
-    }
-
     if ifd_planar(base_ifd) != profile.planar_configuration {
         return Ok(false);
     }
@@ -81,16 +83,74 @@ fn compatible_cog_source(
         return Ok(false);
     }
 
-    let expected_levels = overview_levels(opts, input.width(), input.height());
     if opts.no_overviews {
         if input.overview_count() > 0 {
             return Ok(false);
         }
-    } else if !overview_levels_match(input, &expected_levels, tile_w, tile_h, base_ifd)? {
-        return Ok(false);
     }
 
     Ok(true)
+}
+
+fn try_transcode_remux(
+    input: &GeoTiffFile,
+    output: &Path,
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+) -> Result<bool> {
+    if input.overview_count() == 0 {
+        return Ok(false);
+    }
+
+    let levels = input_overview_levels(input)?;
+    let output_layers = match (profile.sample.bits_per_sample, profile.sample.sample_format) {
+        (8, SampleFormat::Uint) => {
+            crate::transcode::build_transcode_layers::<u8>(input, profile, opts)?
+        }
+        (8, SampleFormat::Int) => {
+            crate::transcode::build_transcode_layers::<i8>(input, profile, opts)?
+        }
+        (16, SampleFormat::Uint) => {
+            crate::transcode::build_transcode_layers::<u16>(input, profile, opts)?
+        }
+        (16, SampleFormat::Int) => {
+            crate::transcode::build_transcode_layers::<i16>(input, profile, opts)?
+        }
+        (32, SampleFormat::Uint) => {
+            crate::transcode::build_transcode_layers::<u32>(input, profile, opts)?
+        }
+        (32, SampleFormat::Int) => {
+            crate::transcode::build_transcode_layers::<i32>(input, profile, opts)?
+        }
+        (32, SampleFormat::Float) => {
+            crate::transcode::build_transcode_layers::<f32>(input, profile, opts)?
+        }
+        (64, SampleFormat::Uint) => {
+            crate::transcode::build_transcode_layers::<u64>(input, profile, opts)?
+        }
+        (64, SampleFormat::Int) => {
+            crate::transcode::build_transcode_layers::<i64>(input, profile, opts)?
+        }
+        (64, SampleFormat::Float) => {
+            crate::transcode::build_transcode_layers::<f64>(input, profile, opts)?
+        }
+        _ => return Ok(false),
+    };
+
+    remux_encoded_layers(profile, opts, output_layers, output, Some(levels))?;
+    Ok(true)
+}
+
+pub(crate) fn input_overview_levels(input: &GeoTiffFile) -> Result<Vec<u32>> {
+    let base_w = input.width();
+    let mut levels = Vec::with_capacity(input.overview_count());
+    for index in 0..input.overview_count() {
+        let ov = input.overview_ifd(index)?;
+        let ov_w = ov.width().max(1);
+        let factor = base_w.div_ceil(ov_w).max(1);
+        levels.push(factor);
+    }
+    Ok(levels)
 }
 
 fn collect_all_layers(input: &GeoTiffFile) -> Result<Vec<Vec<RemuxCompressedBlock>>> {
@@ -109,7 +169,8 @@ fn remux_identity(
     opts: &CogOutputOptions,
 ) -> Result<bool> {
     let layers = collect_all_layers(input)?;
-    remux_with_layers(profile, opts, layers, output)?;
+    let levels = input_overview_levels(input)?;
+    remux_with_layers(profile, opts, layers, output, Some(levels))?;
     Ok(true)
 }
 
@@ -128,7 +189,13 @@ fn remux_planar_band_permute(
         output_layers.push(permute_planar_layer_blocks(layer, ifd, bands)?);
     }
 
-    remux_with_layers(profile, opts, output_layers, output)?;
+    remux_with_layers(
+        profile,
+        opts,
+        output_layers,
+        output,
+        Some(input_overview_levels(input)?),
+    )?;
     Ok(true)
 }
 
@@ -178,111 +245,93 @@ fn try_remux_crop(
     opts: &CogOutputOptions,
     window: &WriteWindow,
 ) -> Result<bool> {
-    let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
-    let tile_size = base_ifd.tile_width().unwrap_or(opts.blocksize) as usize;
-
-    if profile.sample.bits_per_sample == 8 && profile.sample.sample_format == SampleFormat::Uint {
-        let source_layers = collect_all_layers(input)?;
-        let output_layers = crate::hybrid_crop::build_hybrid_crop_layers_u8(
-            input,
-            &source_layers,
-            window,
-            profile,
-            opts,
-        )?;
-        remux_with_layers(profile, opts, output_layers, output)?;
-        return Ok(true);
-    }
-
-    if !is_tile_aligned(window, tile_size) {
-        return Ok(false);
-    }
-
-    let source_layers = collect_all_layers(input)?;
     let output_levels = overview_levels(opts, profile.width, profile.height);
+    let output_layers = match (profile.sample.bits_per_sample, profile.sample.sample_format) {
+        (8, SampleFormat::Uint) => crate::hybrid_crop::build_hybrid_crop_layers::<u8>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (8, SampleFormat::Int) => crate::hybrid_crop::build_hybrid_crop_layers::<i8>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (16, SampleFormat::Uint) => crate::hybrid_crop::build_hybrid_crop_layers::<u16>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (16, SampleFormat::Int) => crate::hybrid_crop::build_hybrid_crop_layers::<i16>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (32, SampleFormat::Uint) => crate::hybrid_crop::build_hybrid_crop_layers::<u32>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (32, SampleFormat::Int) => crate::hybrid_crop::build_hybrid_crop_layers::<i32>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (32, SampleFormat::Float) => crate::hybrid_crop::build_hybrid_crop_layers::<f32>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (64, SampleFormat::Uint) => crate::hybrid_crop::build_hybrid_crop_layers::<u64>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (64, SampleFormat::Int) => crate::hybrid_crop::build_hybrid_crop_layers::<i64>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        (64, SampleFormat::Float) => crate::hybrid_crop::build_hybrid_crop_layers::<f64>(
+            input, window, profile, opts, &output_levels,
+        )?,
+        _ => return Ok(false),
+    };
 
-    let mut output_layers = Vec::with_capacity(1 + output_levels.len());
-    output_layers.push(crop_layer_blocks(
-        &source_layers[0],
-        layer_ifd(input, 0)?,
-        window,
-        tile_size,
-    )?);
-    for (ov_idx, &level) in output_levels.iter().enumerate() {
-        let source_idx = ov_idx + 1;
-        let ifd = layer_ifd(input, source_idx)?;
-        let crop = scale_window(window, level);
-        output_layers.push(crop_layer_blocks(
-            &source_layers[source_idx],
-            ifd,
-            &crop,
-            tile_size,
-        )?);
-    }
-
-    remux_with_layers(profile, opts, output_layers, output)?;
+    remux_with_layers(profile, opts, output_layers, output, Some(output_levels))?;
     Ok(true)
 }
 
-fn is_tile_aligned(window: &WriteWindow, tile_size: usize) -> bool {
-    window.col_off.is_multiple_of(tile_size)
-        && window.row_off.is_multiple_of(tile_size)
-        && window.width.is_multiple_of(tile_size)
-        && window.height.is_multiple_of(tile_size)
-}
-
-fn scale_window(window: &WriteWindow, scale: u32) -> WriteWindow {
-    let scale = scale as usize;
-    WriteWindow {
-        col_off: window.col_off / scale,
-        row_off: window.row_off / scale,
-        width: window.width / scale,
-        height: window.height / scale,
-    }
-}
-
-fn crop_layer_blocks(
-    layer: &[RemuxCompressedBlock],
-    ifd: &Ifd,
-    window: &WriteWindow,
-    tile_size: usize,
-) -> Result<Vec<RemuxCompressedBlock>> {
-    let planar = ifd_planar(ifd) == PlanarConfiguration::Planar;
-    let bands = ifd.samples_per_pixel() as usize;
-    let width = ifd.width() as usize;
-    let height = ifd.height() as usize;
-    let tiles_across = width.div_ceil(tile_size);
-    let tiles_down = height.div_ceil(tile_size);
-    let tiles_per_plane = tiles_across * tiles_down;
-
-    let col0 = window.col_off / tile_size;
-    let row0 = window.row_off / tile_size;
-    let col1 = (window.col_off + window.width).div_ceil(tile_size).min(tiles_across);
-    let row1 = (window.row_off + window.height).div_ceil(tile_size).min(tiles_down);
-
-    let plane_count = if planar { bands } else { 1 };
-    let mut out = Vec::new();
-
-    for plane in 0..plane_count {
-        for row in row0..row1 {
-            for col in col0..col1 {
-                let tile_index = row * tiles_across + col;
-                let block_index = if planar {
-                    plane * tiles_per_plane + tile_index
-                } else {
-                    tile_index
-                };
-                out.push(
-                    layer
-                        .get(block_index)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("missing tile block {block_index}"))?,
-                );
-            }
+fn remux_chunky_band_permute(
+    input: &GeoTiffFile,
+    output: &Path,
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+    bands: &[usize],
+) -> Result<bool> {
+    let output_layers = match (profile.sample.bits_per_sample, profile.sample.sample_format) {
+        (8, SampleFormat::Uint) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<u8>(input, bands, profile, opts)?
         }
-    }
-
-    Ok(out)
+        (8, SampleFormat::Int) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<i8>(input, bands, profile, opts)?
+        }
+        (16, SampleFormat::Uint) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<u16>(input, bands, profile, opts)?
+        }
+        (16, SampleFormat::Int) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<i16>(input, bands, profile, opts)?
+        }
+        (32, SampleFormat::Uint) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<u32>(input, bands, profile, opts)?
+        }
+        (32, SampleFormat::Int) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<i32>(input, bands, profile, opts)?
+        }
+        (32, SampleFormat::Float) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<f32>(input, bands, profile, opts)?
+        }
+        (64, SampleFormat::Uint) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<u64>(input, bands, profile, opts)?
+        }
+        (64, SampleFormat::Int) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<i64>(input, bands, profile, opts)?
+        }
+        (64, SampleFormat::Float) => {
+            crate::chunky_permute::build_chunky_band_permute_layers::<f64>(input, bands, profile, opts)?
+        }
+        _ => return Ok(false),
+    };
+    remux_with_layers(
+        profile,
+        opts,
+        output_layers,
+        output,
+        Some(input_overview_levels(input)?),
+    )?;
+    Ok(true)
 }
 
 fn is_identity_bands(bands: &[usize], band_count: usize) -> bool {
@@ -293,46 +342,28 @@ fn compression_matches(opts: &CogOutputOptions, input: Compression) -> bool {
     opts.compression.to_compression() == input
 }
 
-fn overview_levels_match(
-    input: &GeoTiffFile,
-    expected_levels: &[u32],
-    tile_w: u32,
-    tile_h: u32,
-    base_ifd: &Ifd,
-) -> Result<bool> {
-    if expected_levels.len() != input.overview_count() {
-        return Ok(false);
-    }
-
-    let base_w = base_ifd.width();
-    let base_h = base_ifd.height();
-    for (index, &level) in expected_levels.iter().enumerate() {
-        let ov = input.overview_ifd(index)?;
-        let expected_w = base_w.div_ceil(level);
-        let expected_h = base_h.div_ceil(level);
-        if ov.width() != expected_w || ov.height() != expected_h {
-            return Ok(false);
-        }
-        if ov.tile_width() != Some(tile_w) || ov.tile_height() != Some(tile_h) {
-            return Ok(false);
-        }
-        if input_compression(ov) != input_compression(base_ifd) {
-            return Ok(false);
-        }
-        if ifd_predictor(ov) != ifd_predictor(base_ifd) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 fn remux_with_layers(
     profile: &RasterProfile,
     opts: &CogOutputOptions,
     layers: Vec<Vec<RemuxCompressedBlock>>,
     output: &Path,
+    overview_levels: Option<Vec<u32>>,
 ) -> Result<()> {
-    let cog = configure_cog(profile.base_builder(opts), opts, profile.width, profile.height);
+    remux_encoded_layers(profile, opts, layers, output, overview_levels)
+}
+
+pub(crate) fn remux_encoded_layers(
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+    layers: Vec<Vec<RemuxCompressedBlock>>,
+    output: &Path,
+    overview_levels: Option<Vec<u32>>,
+) -> Result<()> {
+    let cog = if let Some(levels) = overview_levels {
+        crate::cog::configure_cog_with_levels(profile.base_builder(opts), opts, levels)
+    } else {
+        configure_cog(profile.base_builder(opts), opts, profile.width, profile.height)
+    };
     match (profile.sample.bits_per_sample, profile.sample.sample_format) {
         (8, SampleFormat::Uint) => cog.remux_to_file::<u8, _>(output, layers),
         (8, SampleFormat::Int) => cog.remux_to_file::<i8, _>(output, layers),

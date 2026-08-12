@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use geotiff_reader::GeoTiffFile;
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array2, Array3, Axis, s};
 use rayon::prelude::*;
 use tiff_core::SampleFormat;
 use tiff_reader::TiffSample;
@@ -96,8 +97,16 @@ fn convert_typed<T>(
     profile: &RasterProfile,
 ) -> Result<()>
 where
-    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone,
+    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone + Copy + Default,
 {
+    let base_ifd = input
+        .tiff()
+        .ifd(input.base_ifd_index())
+        .context("failed to read base IFD")?;
+    if !base_ifd.is_tiled() {
+        return convert_strip_remux::<T>(pool, request, input, profile);
+    }
+
     let width = profile.width;
     let height = profile.height;
     let out_bands = profile.bands as usize;
@@ -142,6 +151,152 @@ where
     write_bar.done("done");
     progress.finish();
     Ok(())
+}
+
+fn convert_strip_remux<T>(
+    pool: &rayon::ThreadPool,
+    request: &ConvertRequest<'_>,
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+) -> Result<()>
+where
+    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone + Copy + Default,
+{
+    crate::strip_encode::convert_strip_to_remux_cog::<T>(
+        pool,
+        input,
+        request.output,
+        profile,
+        request.opts,
+        request.window,
+        request.bands.as_deref(),
+    )
+}
+
+fn convert_strip_batched<T>(
+    pool: &rayon::ThreadPool,
+    request: &ConvertRequest<'_>,
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+) -> Result<()>
+where
+    T: TiffSample + geotiff_writer::NumericSample + Send + Sync + Clone,
+{
+    let width = profile.width;
+    let height = profile.height;
+    let out_bands = profile.bands as usize;
+    let tile_size = request.opts.blocksize;
+    let window = request.window;
+    let band_map = request.bands.as_deref();
+
+    let cog_builder = configure_cog(profile.base_builder(request.opts), request.opts, width, height);
+    let mut writer = cog_builder
+        .tile_writer_file::<T, _>(request.output)
+        .with_context(|| format!("failed to create COG writer for {}", request.output.display()))?;
+
+    let tiles = tile_jobs(width, height, tile_size);
+    let tile_count = tiles.len();
+    let mut row_groups: BTreeMap<usize, Vec<crate::cog::TileJob>> = BTreeMap::new();
+    for job in tiles {
+        row_groups.entry(job.row_off).or_default().push(job);
+    }
+
+    let progress = ProgressTracker::new(request.show_progress);
+    let read_bar = progress.stage("Read strips", row_groups.len() as u64);
+    let write_bar = progress.stage("Write COG", tile_count as u64 + 1);
+
+    let mut decoded = pool.install(|| -> Result<Vec<_>> {
+        Ok(row_groups
+            .par_iter()
+            .map(|(&row_off, jobs)| {
+                let batch = read_strip_row_batch::<T>(
+                    input,
+                    out_bands,
+                    window,
+                    band_map,
+                    row_off,
+                    jobs,
+                )?;
+                read_bar.inc(1);
+                Ok(batch)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    })?;
+    read_bar.done("done");
+
+    decoded.sort_by_key(|(col, row, _)| (*row, *col));
+
+    for (col_off, row_off, tile) in decoded {
+        match tile {
+            TileWindow::Single(data) => writer
+                .write_tile(col_off, row_off, &data.view())
+                .context("failed to write COG tile")?,
+            TileWindow::Multi(data) => writer
+                .write_tile_3d(col_off, row_off, &data.view())
+                .context("failed to write COG tile")?,
+        }
+        write_bar.inc(1);
+    }
+
+    writer.finish().context("failed to finalize COG")?;
+    write_bar.inc(1);
+    write_bar.done("done");
+    progress.finish();
+    Ok(())
+}
+
+fn read_strip_row_batch<T>(
+    input: &GeoTiffFile,
+    out_bands: usize,
+    window: Option<WriteWindow>,
+    band_map: Option<&[usize]>,
+    row_off: usize,
+    jobs: &[crate::cog::TileJob],
+) -> Result<Vec<(usize, usize, TileWindow<T>)>>
+where
+    T: TiffSample + Clone,
+{
+    let rows = jobs[0].rows;
+    let src_row = window.map(|w| w.row_off + row_off).unwrap_or(row_off);
+    let src_col0 = window.map(|w| w.col_off).unwrap_or(0);
+    let read_cols = jobs
+        .iter()
+        .map(|job| job.col_off + job.cols)
+        .max()
+        .unwrap_or(0);
+
+    let mut out = Vec::with_capacity(jobs.len());
+    if out_bands == 1 {
+        let band_index = band_map.map(|bands| bands[0] - 1).unwrap_or(0);
+        let data = input.read_band_window::<T>(band_index, src_row, src_col0, rows, read_cols)?;
+        let data = data
+            .into_dimensionality::<ndarray::Ix2>()
+            .context("expected 2D strip batch")?;
+        for job in jobs {
+            let tile = data
+                .slice(s![.., job.col_off..job.col_off + job.cols])
+                .to_owned();
+            out.push((job.col_off, job.row_off, TileWindow::Single(tile)));
+        }
+    } else {
+        let data = input.read_window::<T>(src_row, src_col0, rows, read_cols)?;
+        let data = data
+            .into_dimensionality::<ndarray::Ix3>()
+            .context("expected [rows, cols, bands] strip batch")?;
+        for job in jobs {
+            let slice = data.slice(s![.., job.col_off..job.col_off + job.cols, ..]);
+            let tile_data = if let Some(bands) = band_map {
+                select_bands(&slice.to_owned(), bands)?
+            } else {
+                slice.to_owned()
+            };
+            out.push((job.col_off, job.row_off, TileWindow::Multi(tile_data)));
+        }
+    }
+    Ok(out)
 }
 
 fn read_tile<T>(

@@ -19,7 +19,7 @@ use std::path::Path;
 use ndarray::{ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
 use tempfile::tempfile;
-use tiff_core::{ByteOrder, Compression, Predictor, Tag, TagType, TagValue, TAG_SUB_IFDS};
+use tiff_core::{ByteOrder, Compression, Predictor, Tag, TagValue, TAG_SUB_IFDS};
 use tiff_writer::{encoder, ImageBuilder, TiffVariant};
 use tiff_writer::{JpegOptions, LercOptions};
 
@@ -583,14 +583,8 @@ fn validate_overview_levels(levels: &[u32]) -> Result<Vec<u32>> {
 }
 
 fn sub_ifds_tag(count: usize, is_bigtiff: bool) -> Result<Tag> {
-    let count_u64 = checked_len_u64(count, "SubIFD offset count")?;
     if is_bigtiff {
-        Ok(Tag {
-            code: TAG_SUB_IFDS,
-            tag_type: TagType::Ifd8,
-            count: count_u64,
-            value: TagValue::Long8(vec![0; count]),
-        })
+        Ok(Tag::new(TAG_SUB_IFDS, TagValue::Long8(vec![0; count])))
     } else {
         Ok(Tag::new(TAG_SUB_IFDS, TagValue::Long(vec![0; count])))
     }

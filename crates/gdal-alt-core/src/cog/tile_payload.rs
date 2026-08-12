@@ -15,6 +15,47 @@ struct GdalStructuralMetadata {
 const GDAL_STRUCTURAL_METADATA_PREFIX: &str = "GDAL_STRUCTURAL_METADATA_SIZE=";
 const MAX_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 
+pub fn read_layer_block_at(
+    tiff: &TiffFile,
+    ifd: &Ifd,
+    block_index: usize,
+) -> Result<RemuxCompressedBlock> {
+    let offsets = ifd
+        .tile_offsets()
+        .context("remux requires tiled IFD with tile offsets")?;
+    let counts = ifd
+        .tile_byte_counts()
+        .context("remux requires tiled IFD with tile byte counts")?;
+    if offsets.len() != counts.len() {
+        bail!("tile offset/count length mismatch");
+    }
+    let (&offset, &count) = offsets
+        .get(block_index)
+        .zip(counts.get(block_index))
+        .ok_or_else(|| anyhow::anyhow!("block index {block_index} out of range"))?;
+
+    if offset == 0 || count == 0 {
+        return Ok(RemuxCompressedBlock {
+            payload: Vec::new(),
+            sparse: true,
+        });
+    }
+
+    let gdal_meta = parse_gdal_structural_metadata(tiff.source());
+    let payload = read_gdal_block_payload(
+        tiff.source(),
+        gdal_meta.as_ref(),
+        tiff.byte_order(),
+        offset,
+        count,
+        block_index,
+    )?;
+    Ok(RemuxCompressedBlock {
+        payload,
+        sparse: false,
+    })
+}
+
 pub fn read_layer_blocks(tiff: &TiffFile, ifd: &Ifd) -> Result<Vec<RemuxCompressedBlock>> {
     let offsets = ifd
         .tile_offsets()

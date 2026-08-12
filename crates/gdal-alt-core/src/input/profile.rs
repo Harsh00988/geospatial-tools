@@ -24,6 +24,8 @@ pub struct GeorefProfile {
     pub geokeys: GeoKeyDirectory,
     pub affine: Option<GeoTransform>,
     pub transformation_matrix: Option<[f64; 16]>,
+    /// Full ModelTiepointTag payload when the source is GCP-based (no affine transform).
+    pub model_tiepoints: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,7 @@ impl RasterProfile {
                 geokeys: input.geokeys().clone(),
                 affine: input.transform().cloned(),
                 transformation_matrix: read_transformation_matrix(ifd)?,
+                model_tiepoints: read_model_tiepoints(input),
             },
         })
     }
@@ -129,6 +132,9 @@ impl RasterProfile {
         if let Some(affine) = profile.georef.affine.as_mut() {
             *affine = crate::crop::shift_transform(affine, window.col_off, window.row_off);
         }
+        if let Some(tiepoints) = profile.georef.model_tiepoints.as_mut() {
+            shift_model_tiepoints(tiepoints, window.col_off, window.row_off);
+        }
         profile
     }
 
@@ -153,6 +159,8 @@ pub fn apply_georef(mut builder: GeoTiffBuilder, georef: &GeorefProfile) -> GeoT
         builder.transformation_matrix(matrix)
     } else if let Some(transform) = georef.affine {
         builder.transform(transform)
+    } else if let Some(tiepoints) = &georef.model_tiepoints {
+        builder.model_tiepoints(tiepoints.clone())
     } else {
         builder
     }
@@ -175,6 +183,7 @@ pub fn projected_georef(epsg: u16, transform: GeoTransform) -> GeorefProfile {
         geokeys,
         affine: Some(transform),
         transformation_matrix: None,
+        model_tiepoints: None,
     }
 }
 
@@ -208,4 +217,27 @@ fn read_transformation_matrix(ifd: &Ifd) -> Result<Option<[f64; 16]>> {
     let mut matrix = [0.0; 16];
     matrix.copy_from_slice(values);
     Ok(Some(matrix))
+}
+
+fn read_model_tiepoints(input: &GeoTiffFile) -> Option<Vec<f64>> {
+    if input.transform().is_some() || input.metadata().transformation.is_some() {
+        return None;
+    }
+    let tiepoints = &input.metadata().tiepoints;
+    if tiepoints.is_empty() {
+        return None;
+    }
+    Some(
+        tiepoints
+            .iter()
+            .flat_map(|tiepoint| tiepoint.iter().copied())
+            .collect(),
+    )
+}
+
+fn shift_model_tiepoints(tiepoints: &mut [f64], col_off: usize, row_off: usize) {
+    for chunk in tiepoints.chunks_mut(6) {
+        chunk[0] -= col_off as f64;
+        chunk[1] -= row_off as f64;
+    }
 }

@@ -48,6 +48,8 @@ pub struct GeoTiffBuilder {
     pub(crate) pixel_scale: Option<[f64; 3]>,
     pub(crate) tiepoint: Option<[f64; 6]>,
     pub(crate) tiepoint_is_origin: bool,
+    /// Full ModelTiepointTag payload (multiples of 6), used for GCP-style georeferencing.
+    pub(crate) model_tiepoints: Option<Vec<f64>>,
     pub(crate) affine_transform: Option<GeoTransform>,
     pub(crate) transformation_matrix: Option<[f64; 16]>,
     pub(crate) nodata: Option<String>,
@@ -80,6 +82,7 @@ impl GeoTiffBuilder {
             pixel_scale: None,
             tiepoint: None,
             tiepoint_is_origin: false,
+            model_tiepoints: None,
             affine_transform: None,
             transformation_matrix: None,
             nodata: None,
@@ -234,6 +237,7 @@ impl GeoTiffBuilder {
         self.pixel_scale = Some([scale_x, scale_y, 0.0]);
         self.affine_transform = None;
         self.transformation_matrix = None;
+        self.model_tiepoints = None;
         self
     }
 
@@ -243,6 +247,7 @@ impl GeoTiffBuilder {
         self.tiepoint_is_origin = true;
         self.affine_transform = None;
         self.transformation_matrix = None;
+        self.model_tiepoints = None;
         self
     }
 
@@ -252,6 +257,18 @@ impl GeoTiffBuilder {
         self.tiepoint_is_origin = false;
         self.affine_transform = None;
         self.transformation_matrix = None;
+        self.model_tiepoints = None;
+        self
+    }
+
+    /// Set the full ModelTiepointTag payload (GCP grids, thin-plate splines, etc.).
+    pub fn model_tiepoints(mut self, tiepoints: Vec<f64>) -> Self {
+        self.model_tiepoints = Some(tiepoints);
+        self.tiepoint = None;
+        self.tiepoint_is_origin = false;
+        self.affine_transform = None;
+        self.transformation_matrix = None;
+        self.pixel_scale = None;
         self
     }
 
@@ -263,12 +280,14 @@ impl GeoTiffBuilder {
             self.pixel_scale = None;
             self.tiepoint_is_origin = false;
             self.transformation_matrix = None;
+            self.model_tiepoints = None;
         } else {
             self.transformation_matrix = Some(transform.to_transformation_matrix());
             self.affine_transform = None;
             self.tiepoint = None;
             self.pixel_scale = None;
             self.tiepoint_is_origin = false;
+            self.model_tiepoints = None;
         }
         self
     }
@@ -280,6 +299,7 @@ impl GeoTiffBuilder {
         self.tiepoint = None;
         self.pixel_scale = None;
         self.tiepoint_is_origin = false;
+        self.model_tiepoints = None;
         self
     }
 
@@ -417,7 +437,8 @@ impl GeoTiffBuilder {
         let writes_georeferencing = self.transformation_matrix.is_some()
             || self.affine_transform.is_some()
             || self.pixel_scale.is_some()
-            || self.tiepoint.is_some();
+            || self.tiepoint.is_some()
+            || self.model_tiepoints.is_some();
 
         // Georeferencing tags
         if let Some(matrix) = &self.transformation_matrix {
@@ -438,6 +459,11 @@ impl GeoTiffBuilder {
                     TagValue::Double(tp.to_vec()),
                 ));
             }
+        } else if let Some(tiepoints) = &self.model_tiepoints {
+            extra.push(Tag::new(
+                tags::TAG_MODEL_TIEPOINT,
+                TagValue::Double(tiepoints.clone()),
+            ));
         } else {
             if let Some(ps) = &self.pixel_scale {
                 extra.push(Tag::new(
@@ -549,6 +575,18 @@ impl GeoTiffBuilder {
                 "model tiepoint values must be finite".into(),
             ));
         }
+        if let Some(tiepoints) = &self.model_tiepoints {
+            if tiepoints.is_empty() || tiepoints.len() % 6 != 0 {
+                return Err(Error::InvalidConfig(
+                    "model tiepoints must be a non-empty multiple of 6 values".into(),
+                ));
+            }
+            if !tiepoints.iter().all(|value| value.is_finite()) {
+                return Err(Error::InvalidConfig(
+                    "model tiepoint values must be finite".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -591,6 +629,12 @@ impl GeoTiffBuilder {
             pixel_scale[0] *= factor;
             pixel_scale[1] *= factor;
             builder.pixel_scale = Some(pixel_scale);
+        } else if self.model_tiepoints.is_some() {
+            builder.model_tiepoints = None;
+            builder.tiepoint = None;
+            builder.pixel_scale = None;
+            builder.affine_transform = None;
+            builder.transformation_matrix = None;
         }
 
         builder
