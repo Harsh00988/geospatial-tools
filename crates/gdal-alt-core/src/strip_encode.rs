@@ -6,6 +6,7 @@ use geotiff_writer::{remux_compress_tile, RemuxCompressedBlock, RemuxTileEncodin
 use ndarray::{Array2, Array3, Axis, s};
 use rayon::prelude::*;
 use tiff_reader::TiffSample;
+use tiff_core::SampleFormat;
 
 use crate::cog::{overview_levels, tile_jobs, CogOutputOptions, TileJob};
 use crate::crop::WriteWindow;
@@ -33,7 +34,7 @@ where
     let out_bands = profile.bands as usize;
     let tile_size = opts.blocksize as usize;
     let levels = overview_levels(opts, width, height);
-    let encoding = output_tile_encoding(opts, tile_size, out_bands as u16);
+    let encoding = output_tile_encoding(opts, tile_size, out_bands as u16, profile.sample.sample_format);
     let progress = ProgressTracker::new(show_progress);
     let encode_total = encode_row_group_total(width, height, tile_size, &levels);
     let encode_bar = progress.stage("Encode tiles", encode_total);
@@ -1156,6 +1157,11 @@ fn pad_tile_chunky<T: Copy + Default>(
     out
 }
 
-pub(crate) fn output_tile_encoding(opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
-    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, None)
+pub(crate) fn output_tile_encoding(
+    opts: &CogOutputOptions,
+    tile_size: usize,
+    spp: u16,
+    sample_format: SampleFormat,
+) -> RemuxTileEncoding {
+    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, None, sample_format)
 }

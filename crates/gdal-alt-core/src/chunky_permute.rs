@@ -52,7 +52,7 @@ where
 {
     let ifd = layer_ifd(input, layer_index)?;
     let jobs = tile_jobs(ifd.width(), ifd.height(), tile_size as u32);
-    let encoding = tile_encoding(ifd, opts, tile_size, bands.len() as u16);
+    let encoding = tile_encoding(ifd, opts, tile_size, bands.len() as u16)?;
 
     let mut blocks = jobs
         .par_iter()
@@ -125,7 +125,19 @@ fn pad_tile_chunky<T: Copy + Default>(
     out
 }
 
-fn tile_encoding(ifd: &Ifd, opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
+fn tile_encoding(
+    ifd: &tiff_reader::Ifd,
+    opts: &CogOutputOptions,
+    tile_size: usize,
+    spp: u16,
+) -> Result<RemuxTileEncoding> {
     let predictor = Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None);
-    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, Some(predictor))
+    let sample_format = crate::cog::tile_payload::ifd_sample_format(ifd)?;
+    Ok(crate::cog::tile_encoding_from_opts(
+        opts,
+        tile_size,
+        spp,
+        Some(predictor),
+        sample_format,
+    ))
 }

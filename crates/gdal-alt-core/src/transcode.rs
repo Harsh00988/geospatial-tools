@@ -28,9 +28,23 @@ where
         .into_par_iter()
         .map(|layer_index| {
             if planar {
-                build_planar_transcode_layer::<T>(input, layer_index, opts, tile_size, bands)
+                build_planar_transcode_layer::<T>(
+                    input,
+                    layer_index,
+                    opts,
+                    tile_size,
+                    bands,
+                    profile.sample.sample_format,
+                )
             } else {
-                build_chunky_transcode_layer::<T>(input, layer_index, opts, tile_size, bands)
+                build_chunky_transcode_layer::<T>(
+                    input,
+                    layer_index,
+                    opts,
+                    tile_size,
+                    bands,
+                    profile.sample.sample_format,
+                )
             }
         })
         .collect()
@@ -42,13 +56,14 @@ fn build_planar_transcode_layer<T>(
     opts: &CogOutputOptions,
     tile_size: usize,
     bands: usize,
+    sample_format: tiff_core::SampleFormat,
 ) -> Result<Vec<RemuxCompressedBlock>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
 {
     let ifd = layer_ifd(input, layer_index)?;
     let jobs = tile_jobs(ifd.width(), ifd.height(), tile_size as u32);
-    let encoding = output_tile_encoding(opts, tile_size, 1);
+    let encoding = output_tile_encoding(opts, tile_size, 1, sample_format);
 
     let mut work: Vec<(usize, usize, TileJob)> = Vec::with_capacity(jobs.len() * bands);
     for (tile_idx, job) in jobs.iter().copied().enumerate() {
@@ -79,13 +94,14 @@ fn build_chunky_transcode_layer<T>(
     opts: &CogOutputOptions,
     tile_size: usize,
     bands: usize,
+    sample_format: tiff_core::SampleFormat,
 ) -> Result<Vec<RemuxCompressedBlock>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
 {
     let ifd = layer_ifd(input, layer_index)?;
     let jobs = tile_jobs(ifd.width(), ifd.height(), tile_size as u32);
-    let encoding = output_tile_encoding(opts, tile_size, bands as u16);
+    let encoding = output_tile_encoding(opts, tile_size, bands as u16, sample_format);
 
     let mut blocks = jobs
         .par_iter()
@@ -184,6 +200,11 @@ fn pad_tile_chunky<T: Copy + Default>(
     out
 }
 
-fn output_tile_encoding(opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
-    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, None)
+fn output_tile_encoding(
+    opts: &CogOutputOptions,
+    tile_size: usize,
+    spp: u16,
+    sample_format: tiff_core::SampleFormat,
+) -> RemuxTileEncoding {
+    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, None, sample_format)
 }

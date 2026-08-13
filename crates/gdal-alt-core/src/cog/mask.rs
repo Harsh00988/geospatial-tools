@@ -3,7 +3,7 @@ use geotiff_reader::GeoTiffFile;
 use geotiff_writer::{remux_compress_tile, RemuxCompressedBlock, RemuxLayer, RemuxMaskDescriptor, RemuxTileEncoding};
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
-use tiff_core::{Predictor, TAG_NEW_SUBFILE_TYPE, TAG_SUBFILE_TYPE};
+use tiff_core::{Predictor, SampleFormat, TAG_NEW_SUBFILE_TYPE, TAG_SUBFILE_TYPE};
 use tiff_reader::{Ifd, TagValue};
 
 use super::options::CogOutputOptions;
@@ -375,7 +375,13 @@ fn pad_mask_tile(samples: &[u8], rows: usize, cols: usize, tile_size: usize) -> 
 }
 
 fn mask_tile_encoding(opts: &CogOutputOptions, tile_size: usize) -> RemuxTileEncoding {
-    crate::cog::tile_encoding_from_opts(opts, tile_size, 1, Some(Predictor::None))
+    crate::cog::tile_encoding_from_opts(
+        opts,
+        tile_size,
+        1,
+        Some(Predictor::None),
+        SampleFormat::Uint,
+    )
 }
 
 fn cropped_mask_descriptor(

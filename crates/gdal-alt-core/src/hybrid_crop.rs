@@ -123,7 +123,7 @@ where
                 spec.opts,
                 spec.tile_size,
                 if spec.planar { 1 } else { spec.bands as u16 },
-            );
+            )?;
             let src_win = scale_window(spec.window, src_factor);
             return if spec.planar {
                 build_generated_planar_layer::<T>(
@@ -173,7 +173,7 @@ where
         spec.opts,
         spec.tile_size,
         if spec.planar { 1 } else { spec.bands as u16 },
-    );
+    )?;
     let (source_layer_index, src_win, source_factor) = if out_idx > 0 {
         if let Some(src_ov) = source_factors.iter().position(|&factor| factor == parent_level) {
             (src_ov + 1, scale_window(spec.window, parent_level), parent_level)
@@ -541,7 +541,7 @@ fn build_planar_layer<T>(
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
 {
-    let encoding = tile_encoding(params.ifd, params.opts, params.tile_size, 1);
+    let encoding = tile_encoding(params.ifd, params.opts, params.tile_size, 1)?;
     let ctx = HybridTileContext {
         input: params.input,
         tiff: params.input.tiff(),
@@ -584,7 +584,7 @@ where
         params.opts,
         params.tile_size,
         params.bands as u16,
-    );
+    )?;
     let ctx = HybridTileContext {
         input: params.input,
         tiff: params.input.tiff(),
@@ -803,9 +803,21 @@ fn pad_tile_chunky<T: Copy + Default>(
     out
 }
 
-fn tile_encoding(ifd: &Ifd, opts: &CogOutputOptions, tile_size: usize, spp: u16) -> RemuxTileEncoding {
+fn tile_encoding(
+    ifd: &Ifd,
+    opts: &CogOutputOptions,
+    tile_size: usize,
+    spp: u16,
+) -> Result<RemuxTileEncoding> {
     let predictor = Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None);
-    crate::cog::tile_encoding_from_opts(opts, tile_size, spp, Some(predictor))
+    let sample_format = crate::cog::tile_payload::ifd_sample_format(ifd)?;
+    Ok(crate::cog::tile_encoding_from_opts(
+        opts,
+        tile_size,
+        spp,
+        Some(predictor),
+        sample_format,
+    ))
 }
 
 fn output_layer_size(

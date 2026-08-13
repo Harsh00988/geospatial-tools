@@ -1,6 +1,7 @@
 use geotiff_writer::cog::{CogBuilder, OverviewStorage, RemuxTileEncoding};
 use geotiff_writer::GeoTiffBuilder;
 use tiff_core::Predictor;
+use tiff_core::SampleFormat;
 
 use super::grid::auto_overview_levels;
 use super::options::{CogOutputOptions, CompressionChoice};
@@ -9,12 +10,17 @@ pub fn overview_levels(opts: &CogOutputOptions, width: u32, height: u32) -> Vec<
     opts.effective_overview_levels(width, height)
 }
 
-pub fn apply_compression(builder: GeoTiffBuilder, opts: &CogOutputOptions) -> GeoTiffBuilder {
+pub fn apply_compression(
+    builder: GeoTiffBuilder,
+    opts: &CogOutputOptions,
+    sample_format: SampleFormat,
+) -> GeoTiffBuilder {
     let mut builder = builder.compression(opts.compression.to_compression());
+    let predictor = opts.encode_predictor_for(sample_format);
     match opts.compression {
         CompressionChoice::Deflate | CompressionChoice::Zstd => {
             builder = builder.deflate_level(opts.deflate_level);
-            builder = builder.predictor(opts.encode_predictor());
+            builder = builder.predictor(predictor);
         }
         CompressionChoice::Lerc => {
             builder = builder.lerc_options(opts.lerc_options());
@@ -23,7 +29,7 @@ pub fn apply_compression(builder: GeoTiffBuilder, opts: &CogOutputOptions) -> Ge
             builder = builder.jpeg_options(opts.jpeg_options());
         }
         CompressionChoice::Lzw => {
-            builder = builder.predictor(opts.encode_predictor());
+            builder = builder.predictor(predictor);
         }
         CompressionChoice::None => {}
     }
@@ -36,6 +42,7 @@ pub fn tile_encoding_from_opts(
     tile_size: usize,
     samples_per_pixel: u16,
     predictor: Option<Predictor>,
+    sample_format: SampleFormat,
 ) -> RemuxTileEncoding {
     let (lerc_options, jpeg_options) = match opts.compression {
         CompressionChoice::Lerc => (Some(opts.lerc_options()), None),
@@ -44,7 +51,8 @@ pub fn tile_encoding_from_opts(
     };
     RemuxTileEncoding {
         compression: opts.compression.to_compression(),
-        predictor: predictor.unwrap_or_else(|| opts.encode_predictor()),
+        predictor: predictor
+            .unwrap_or_else(|| opts.encode_predictor_for(sample_format)),
         samples_per_pixel,
         tile_width: tile_size,
         tile_height: tile_size as u32,

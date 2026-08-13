@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufWriter;
 use std::sync::Arc;
-use tiff_core::PlanarConfiguration;
+use tiff_core::{PlanarConfiguration, SampleFormat};
 
 const OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
@@ -64,6 +64,7 @@ fn convert_typed<T: Jp2Sample>(
                     u16::from(raster.bits_per_sample),
                 )),
             &opts,
+            SampleFormat::Uint,
         ),
         &georef,
     );

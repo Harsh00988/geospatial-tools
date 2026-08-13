@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use geotiff_writer::cog::Resampling;
 use geotiff_writer::{Compression, JpegOptions, LercOptions};
-use tiff_core::{LercAdditionalCompression, Predictor};
+use tiff_core::{LercAdditionalCompression, Predictor, SampleFormat};
 
 use super::grid::auto_overview_levels;
 
@@ -175,10 +175,19 @@ impl CogOutputOptions {
         }
     }
 
-    pub fn encode_predictor(&self) -> Predictor {
+    pub fn encode_predictor_for(&self, sample_format: SampleFormat) -> Predictor {
+        if sample_format == SampleFormat::Float {
+            return Predictor::None;
+        }
         match self.compression {
-            CompressionChoice::Deflate | CompressionChoice::Zstd => Predictor::Horizontal,
+            CompressionChoice::Deflate | CompressionChoice::Zstd | CompressionChoice::Lzw => {
+                Predictor::Horizontal
+            }
             _ => Predictor::None,
         }
+    }
+
+    pub fn encode_predictor(&self) -> Predictor {
+        self.encode_predictor_for(SampleFormat::Uint)
     }
 }

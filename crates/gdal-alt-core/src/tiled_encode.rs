@@ -29,7 +29,7 @@ where
     let out_bands = profile.bands as usize;
     let tile_size = opts.blocksize as usize;
     let levels = overview_levels(opts, width, height);
-    let encoding = output_tile_encoding(opts, tile_size, out_bands as u16);
+    let encoding = output_tile_encoding(opts, tile_size, out_bands as u16, profile.sample.sample_format);
     let progress = ProgressTracker::new(show_progress);
     let encode_total = encode_row_group_total(width, height, tile_size, &levels);
     let encode_bar = progress.stage("Encode tiles", encode_total);

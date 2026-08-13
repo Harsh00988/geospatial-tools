@@ -122,7 +122,7 @@ impl RasterProfile {
             builder = builder.nodata(nodata);
         }
 
-        apply_compression(builder, opts)
+        apply_compression(builder, opts, self.sample.sample_format)
     }
 
     pub fn with_window(&self, window: &crate::crop::WriteWindow) -> Self {
