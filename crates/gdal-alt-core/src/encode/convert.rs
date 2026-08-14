@@ -4,6 +4,9 @@ use tiff_reader::TiffSample;
 
 use crate::cog::{configure_cog, overview_levels, CogOutputOptions};
 use crate::crop::WriteWindow;
+use crate::encode::mask_stream::{
+    encode_with_streaming_masks, mask_streaming_plan_for_encode, open_streaming_masked_writer,
+};
 use crate::encode::overview::{encode_layers_with_spool, encode_overview_layers};
 use crate::encode::sink::StreamingCogSink;
 use crate::encode::strip::{encode_row_group_total, output_tile_encoding};
@@ -37,34 +40,68 @@ where
     let encode_bar = progress.stage("Encode tiles", encode_total);
 
     if encode_output_needs_mask_remux(input, profile, opts) {
-        let spool = pool.install(|| {
-            encode_layers_with_spool::<T>(
-                input,
-                width,
-                height,
-                tile_size,
-                out_bands,
-                window,
-                band_map,
-                encoding,
-                opts,
-                &levels,
-                nodata,
-                Some(&encode_bar),
-            )
-        })?;
-        encode_bar.done("done");
-        remux_encoded_layers_from_spool(
+        if let Some(plan) = mask_streaming_plan_for_encode(
             input,
             profile,
             opts,
-            spool,
-            output,
-            window.as_ref(),
-            Some(levels),
-            None,
-            show_progress,
-        )?;
+            window,
+            width,
+            height,
+            &levels,
+        )? {
+            let stream =
+                open_streaming_masked_writer::<T>(profile, opts, output, width, height, &levels, &plan)?;
+            pool.install(|| {
+                encode_with_streaming_masks::<T>(
+                    input,
+                    &stream,
+                    profile,
+                    &plan,
+                    width,
+                    height,
+                    tile_size,
+                    out_bands,
+                    window,
+                    band_map,
+                    encoding,
+                    opts,
+                    &levels,
+                    nodata,
+                    Some(&encode_bar),
+                )
+            })?;
+            encode_bar.done("done");
+            stream.finish().map_err(|err| anyhow::anyhow!(err))?;
+        } else {
+            let spool = pool.install(|| {
+                encode_layers_with_spool::<T>(
+                    input,
+                    width,
+                    height,
+                    tile_size,
+                    out_bands,
+                    window,
+                    band_map,
+                    encoding,
+                    opts,
+                    &levels,
+                    nodata,
+                    Some(&encode_bar),
+                )
+            })?;
+            encode_bar.done("done");
+            remux_encoded_layers_from_spool(
+                input,
+                profile,
+                opts,
+                spool,
+                output,
+                window.as_ref(),
+                Some(levels),
+                None,
+                show_progress,
+            )?;
+        }
     } else {
         let cog = configure_cog(profile.base_builder(opts), opts, width, height);
         let stream = cog.open_streaming_rgb_writer::<T, _>(output, 1 + levels.len())?;

@@ -1,4 +1,5 @@
 mod convert;
+mod mask_stream;
 mod overview;
 pub mod sink;
 pub(crate) mod strip;

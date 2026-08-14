@@ -1201,6 +1201,81 @@ impl CogBuilder {
         Ok(images)
     }
 
+    fn build_streaming_cog_images<T: NumericSample>(
+        &self,
+        layer_specs: &[StreamingCogLayerSpec],
+        overview_levels: &[u32],
+        tile_width: u32,
+        tile_height: u32,
+    ) -> Result<Vec<CogImage>> {
+        if layer_specs.is_empty() {
+            return Err(Error::Other("streaming COG requires at least one layer".into()));
+        }
+        let has_masks = layer_specs
+            .iter()
+            .any(|spec| matches!(spec, StreamingCogLayerSpec::Mask(_)));
+        let rgb_count = layer_specs
+            .iter()
+            .filter(|spec| matches!(spec, StreamingCogLayerSpec::Rgb))
+            .count();
+        if rgb_count != 1 + overview_levels.len() {
+            return Err(Error::Other(format!(
+                "streaming COG expected {} RGB layers, plan has {rgb_count}",
+                1 + overview_levels.len()
+            )));
+        }
+
+        let mut images = Vec::with_capacity(layer_specs.len());
+        let mut rgb_index = 0usize;
+        let mut overview_index = 0usize;
+
+        for spec in layer_specs {
+            match spec {
+                StreamingCogLayerSpec::Rgb => {
+                    if rgb_index == 0 {
+                        images.push(CogImage {
+                            builder: self.inner.to_image_builder::<T>()?,
+                            mask: None,
+                            blocks: Vec::new(),
+                            sub_ifd_count: if !has_masks
+                                && matches!(self.overview_storage, OverviewStorage::SubIfds)
+                            {
+                                overview_levels.len()
+                            } else {
+                                0
+                            },
+                        });
+                    } else {
+                        let level = overview_levels[overview_index];
+                        images.push(CogImage {
+                            builder: self.overview_image_builder::<T>(
+                                level,
+                                tile_width,
+                                tile_height,
+                                overview_index,
+                            )?,
+                            mask: None,
+                            blocks: Vec::new(),
+                            sub_ifd_count: 0,
+                        });
+                        overview_index += 1;
+                    }
+                    rgb_index += 1;
+                }
+                StreamingCogLayerSpec::Mask(descriptor) => {
+                    images.push(CogImage {
+                        builder: ImageBuilder::new(descriptor.width, descriptor.height),
+                        mask: Some(descriptor.clone()),
+                        blocks: Vec::new(),
+                        sub_ifd_count: 0,
+                    });
+                }
+            }
+        }
+
+        Ok(images)
+    }
+
     fn build_remux_cog_images<T: NumericSample>(
         &self,
         layers: &[RemuxLayer],
@@ -3185,12 +3260,31 @@ impl CogBuilder {
         path: P,
         rgb_layer_count: usize,
     ) -> Result<StreamingRgbCogWriter> {
-        StreamingRgbCogWriter::create::<T, P>(self, path, rgb_layer_count)
+        let specs = (0..rgb_layer_count)
+            .map(|_| StreamingCogLayerSpec::Rgb)
+            .collect::<Vec<_>>();
+        self.open_streaming_cog_writer::<T, P>(path, &specs)
+    }
+
+    /// Open a COG output file and stream interleaved RGB and mask layers directly.
+    pub fn open_streaming_cog_writer<T: NumericSample, P: AsRef<Path>>(
+        &self,
+        path: P,
+        layer_specs: &[StreamingCogLayerSpec],
+    ) -> Result<StreamingRgbCogWriter> {
+        StreamingRgbCogWriter::create::<T, P>(self, path, layer_specs)
     }
 }
 
 struct PendingRemuxBlocks {
     blocks: std::collections::BTreeMap<usize, RemuxCompressedBlock>,
+}
+
+/// One layer in a streaming COG write plan (RGB pyramid level or GDAL mask IFD).
+#[derive(Clone, Debug)]
+pub enum StreamingCogLayerSpec {
+    Rgb,
+    Mask(RemuxMaskDescriptor),
 }
 
 impl PendingRemuxBlocks {
@@ -3241,13 +3335,13 @@ impl StreamingRgbCogWriter {
     fn create<T: NumericSample, P: AsRef<Path>>(
         cog: &CogBuilder,
         path: P,
-        rgb_layer_count: usize,
+        layer_specs: &[StreamingCogLayerSpec],
     ) -> Result<Self> {
         let overview_levels = cog.normalized_overview_levels()?;
         let tile_width = cog.inner.tile_width.unwrap_or(256);
         let tile_height = cog.inner.tile_height.unwrap_or(256);
-        let images = cog.build_remux_rgb_cog_images::<T>(
-            rgb_layer_count,
+        let images = cog.build_streaming_cog_images::<T>(
+            layer_specs,
             &overview_levels,
             tile_width,
             tile_height,
@@ -3269,7 +3363,7 @@ impl StreamingRgbCogWriter {
                 images: Mutex::new(images),
                 tile_tail: Arc::new(Mutex::new(0)),
                 layer_index: Mutex::new(0),
-                layer_count: rgb_layer_count,
+                layer_count: layer_specs.len(),
             }),
         })
     }

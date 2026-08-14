@@ -314,6 +314,284 @@ pub fn build_cropped_mask_layers(
     Ok((blocks, descriptors))
 }
 
+/// Metadata for streaming mask layers alongside RGB encode (no full-RGB spool).
+pub(crate) struct MaskStreamingPlan {
+    pub descriptors: Vec<RemuxMaskDescriptor>,
+    source: MaskStreamingSource,
+}
+
+enum MaskStreamingSource {
+    Dataset {
+        masks: DatasetMasks,
+        window: Option<WriteWindow>,
+    },
+    Synthesized {
+        transparency: TransparencySource,
+        window: Option<WriteWindow>,
+    },
+}
+
+/// Build interleaved RGB/mask layer plan for [`StreamingCogLayerSpec`].
+pub(crate) fn streaming_mask_layer_specs(
+    rgb_layer_count: usize,
+    descriptors: &[RemuxMaskDescriptor],
+) -> Vec<geotiff_writer::StreamingCogLayerSpec> {
+    use geotiff_writer::StreamingCogLayerSpec;
+    let mut specs = Vec::with_capacity(rgb_layer_count + descriptors.len());
+    specs.push(StreamingCogLayerSpec::Rgb);
+    specs.push(StreamingCogLayerSpec::Mask(descriptors[0].clone()));
+    for _ in 1..rgb_layer_count {
+        specs.push(StreamingCogLayerSpec::Rgb);
+    }
+    for descriptor in descriptors.iter().skip(1) {
+        specs.push(StreamingCogLayerSpec::Mask(descriptor.clone()));
+    }
+    specs
+}
+
+/// Resolve mask descriptors and how to produce each mask layer without loading RGB tiles.
+pub(crate) fn resolve_mask_streaming_plan(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+    window: Option<WriteWindow>,
+    out_width: u32,
+    out_height: u32,
+    overview_levels: &[u32],
+    rgb_layer_count: usize,
+) -> Result<Option<MaskStreamingPlan>> {
+    if let Some(masks) = discover_dataset_masks(input) {
+        let descriptors = mask_layer_descriptors(input, &masks)?;
+        let aligned = align_mask_descriptors(&descriptors, rgb_layer_count)?;
+        return Ok(Some(MaskStreamingPlan {
+            descriptors: aligned,
+            source: MaskStreamingSource::Dataset {
+                masks,
+                window,
+            },
+        }));
+    }
+
+    let transparency = detect_transparency(
+        input,
+        profile,
+        opts.mask_from_alpha,
+        opts.black_rgb_transparent,
+    );
+    if matches!(
+        transparency,
+        TransparencySource::AssociatedAlpha | TransparencySource::BlackRgb
+    ) {
+        let descriptors = synthesized_mask_descriptors(
+            input,
+            out_width,
+            out_height,
+            overview_levels,
+            opts,
+        )?;
+        let aligned = align_mask_descriptors(&descriptors, rgb_layer_count)?;
+        return Ok(Some(MaskStreamingPlan {
+            descriptors: aligned,
+            source: MaskStreamingSource::Synthesized {
+                transparency,
+                window,
+            },
+        }));
+    }
+
+    Ok(None)
+}
+
+fn align_mask_descriptors(
+    descriptors: &[RemuxMaskDescriptor],
+    rgb_layer_count: usize,
+) -> Result<Vec<RemuxMaskDescriptor>> {
+    let expected_masks = if rgb_layer_count == 0 {
+        0
+    } else {
+        1 + rgb_layer_count - 1
+    };
+    if descriptors.len() < expected_masks {
+        bail!(
+            "source has {} mask layers but output needs {}",
+            descriptors.len(),
+            expected_masks
+        );
+    }
+    Ok(descriptors.iter().take(expected_masks).cloned().collect())
+}
+
+fn synthesized_mask_descriptors(
+    input: &GeoTiffFile,
+    out_width: u32,
+    out_height: u32,
+    overview_levels: &[u32],
+    opts: &CogOutputOptions,
+) -> Result<Vec<RemuxMaskDescriptor>> {
+    let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
+    let mut descriptors = vec![synthesized_mask_descriptor(
+        out_width,
+        out_height,
+        opts.blocksize,
+        false,
+        base_ifd,
+    )];
+    for &level in overview_levels {
+        let layer_w = (out_width / level).max(1);
+        let layer_h = (out_height / level).max(1);
+        descriptors.push(synthesized_mask_descriptor(
+            layer_w,
+            layer_h,
+            opts.blocksize,
+            true,
+            base_ifd,
+        ));
+    }
+    Ok(descriptors)
+}
+
+/// Encode or copy one mask pyramid layer for streaming COG output.
+pub(crate) fn encode_mask_streaming_layer(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    plan: &MaskStreamingPlan,
+    layer_index: usize,
+    out_width: u32,
+    out_height: u32,
+    overview_levels: &[u32],
+    opts: &CogOutputOptions,
+) -> Result<Vec<RemuxCompressedBlock>> {
+    match &plan.source {
+        MaskStreamingSource::Dataset { masks, window } => {
+            if let Some(window) = window {
+                encode_dataset_mask_layer_cropped(
+                    input,
+                    masks,
+                    window,
+                    out_width,
+                    out_height,
+                    overview_levels,
+                    opts,
+                    layer_index,
+                )
+            } else {
+                read_dataset_mask_layer(input, masks, layer_index)
+            }
+        }
+        MaskStreamingSource::Synthesized {
+            transparency,
+            window,
+        } => {
+            if layer_index == 0 {
+                encode_synthesized_mask_layer(
+                    input,
+                    profile,
+                    *transparency,
+                    window.as_ref(),
+                    out_width,
+                    out_height,
+                    opts.blocksize as usize,
+                    mask_tile_encoding(opts, opts.blocksize as usize),
+                )
+            } else {
+                let level = overview_levels[layer_index - 1];
+                let scaled = window.map(|w| scale_window(&w, level));
+                let layer_w = (out_width / level).max(1);
+                let layer_h = (out_height / level).max(1);
+                encode_synthesized_mask_layer(
+                    input,
+                    profile,
+                    *transparency,
+                    scaled.as_ref(),
+                    layer_w,
+                    layer_h,
+                    opts.blocksize as usize,
+                    mask_tile_encoding(opts, opts.blocksize as usize),
+                )
+            }
+        }
+    }
+}
+
+fn read_dataset_mask_layer(
+    input: &GeoTiffFile,
+    masks: &DatasetMasks,
+    layer_index: usize,
+) -> Result<Vec<RemuxCompressedBlock>> {
+    let ifd_index = if layer_index == 0 {
+        masks.base_ifd_index
+    } else {
+        *masks
+            .overview_ifd_indices
+            .get(layer_index - 1)
+            .ok_or_else(|| anyhow::anyhow!("missing mask overview IFD for layer {layer_index}"))?
+    };
+    let tiff = input.tiff();
+    let ifd = tiff
+        .ifd(ifd_index)
+        .map_err(|err| anyhow::anyhow!("mask IFD {ifd_index}: {err}"))?;
+    read_layer_blocks(tiff, ifd)
+}
+
+fn encode_dataset_mask_layer_cropped(
+    input: &GeoTiffFile,
+    masks: &DatasetMasks,
+    window: &WriteWindow,
+    out_width: u32,
+    out_height: u32,
+    overview_levels: &[u32],
+    opts: &CogOutputOptions,
+    layer_index: usize,
+) -> Result<Vec<RemuxCompressedBlock>> {
+    let tiff = input.tiff();
+    let tile_size = opts.blocksize as usize;
+    let encoding = mask_tile_encoding(opts, tile_size);
+
+    if layer_index == 0 {
+        let ifd = tiff.ifd(masks.base_ifd_index)?;
+        return encode_cropped_mask_layer(
+            tiff,
+            ifd,
+            window,
+            out_width,
+            out_height,
+            tile_size,
+            encoding,
+        );
+    }
+
+    let ov_index = layer_index - 1;
+    let level = overview_levels
+        .get(ov_index)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("missing overview level for mask layer {layer_index}"))?;
+    let ifd_index = masks
+        .overview_ifd_indices
+        .get(ov_index)
+        .copied()
+        .unwrap_or(masks.base_ifd_index);
+    let ifd = tiff.ifd(ifd_index)?;
+    let scaled = scale_window(window, level);
+    let layer_w = (out_width / level).max(1);
+    let layer_h = (out_height / level).max(1);
+    let layer_tile = if ov_index < masks.overview_ifd_indices.len() {
+        ifd.tile_width().unwrap_or(opts.blocksize)
+    } else {
+        opts.blocksize
+    };
+    let layer_tile_size = layer_tile as usize;
+    let layer_encoding = mask_tile_encoding(opts, layer_tile_size);
+    encode_cropped_mask_layer(
+        tiff,
+        ifd,
+        &scaled,
+        layer_w,
+        layer_h,
+        layer_tile_size,
+        layer_encoding,
+    )
+}
+
 fn encode_cropped_mask_layer(
     tiff: &tiff_reader::TiffFile,
     ifd: &Ifd,

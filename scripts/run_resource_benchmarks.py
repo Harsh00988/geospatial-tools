@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -20,6 +22,10 @@ BIN = ROOT / "target" / "release"
 DEFAULT_DATA = Path.home() / "Downloads" / "test_data"
 OUT_ROOT = DEFAULT_DATA / "benchmarks" / "resource"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_JOB_TIMEOUT_S = 1800.0
+FASTINFO_RUNS = 3
+FASTINFO_RUNS_HEAVY = 1
 
 GDAL_COG = [
     "gdal_translate",
@@ -113,9 +119,24 @@ def _tree_procs(root: psutil.Process) -> list[psutil.Process]:
         return [root]
 
 
-def run_measured(cmd: list[str], *, out: Path | None = None) -> ResourceMetrics:
-    if out is not None and out.exists():
-        out.unlink()
+def cleanup_output(path: Path | None) -> None:
+    if path is None:
+        return
+    if path.exists():
+        path.unlink()
+    for suffix in (".aux.xml", ".ovr"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def run_measured(
+    cmd: list[str],
+    *,
+    out: Path | None = None,
+    timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+) -> ResourceMetrics:
+    cleanup_output(out)
 
     metrics = ResourceMetrics()
     stop = threading.Event()
@@ -154,7 +175,25 @@ def run_measured(cmd: list[str], *, out: Path | None = None) -> ResourceMetrics:
     proc = subprocess.Popen(cmd, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     mon = threading.Thread(target=monitor, args=(proc.pid,), daemon=True)
     mon.start()
-    code = proc.wait()
+    try:
+        code = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        stop.set()
+        for p in _tree_procs(psutil.Process(proc.pid)):
+            try:
+                p.kill()
+            except psutil.Error:
+                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait(timeout=5.0)
+        mon.join(timeout=2.0)
+        metrics.wall_s = time.perf_counter() - t0
+        metrics.ok = False
+        cleanup_output(out)
+        return metrics
     stop.set()
     mon.join(timeout=2.0)
     metrics.wall_s = time.perf_counter() - t0
@@ -166,11 +205,19 @@ def run_measured(cmd: list[str], *, out: Path | None = None) -> ResourceMetrics:
     metrics.ok = code == 0
     if out is not None:
         metrics.ok = metrics.ok and out.exists() and out.stat().st_size > 0
+    if not metrics.ok:
+        cleanup_output(out)
     return metrics
 
 
-def bench_cmd(cmd: list[str], out: Path | None = None, runs: int = 1) -> ResourceMetrics:
-    samples = [run_measured(cmd, out=out) for _ in range(runs)]
+def bench_cmd(
+    cmd: list[str],
+    out: Path | None = None,
+    runs: int = 1,
+    *,
+    timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+) -> ResourceMetrics:
+    samples = [run_measured(cmd, out=out, timeout_s=timeout_s) for _ in range(runs)]
     if not all(s.ok for s in samples):
         return next(s for s in samples if not s.ok)
 
@@ -234,14 +281,17 @@ def pair_bench(
     gdal_out: Path | None,
     *,
     runs: int = 1,
+    timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
 ) -> None:
     if fast_out is not None:
         fast_out.parent.mkdir(parents=True, exist_ok=True)
+        cleanup_output(fast_out)
     if gdal_out is not None:
         gdal_out.parent.mkdir(parents=True, exist_ok=True)
+        cleanup_output(gdal_out)
 
-    fast_m = bench_cmd(fast_cmd, fast_out, runs=runs)
-    gdal_m = bench_cmd(gdal_cmd, gdal_out, runs=runs)
+    fast_m = bench_cmd(fast_cmd, fast_out, runs=runs, timeout_s=timeout_s)
+    gdal_m = bench_cmd(gdal_cmd, gdal_out, runs=runs, timeout_s=timeout_s)
 
     if fast_out and fast_m.ok:
         v_fast = validate(fast_out)
@@ -341,11 +391,49 @@ def write_report(results: list[PairResult], data_dir: Path) -> Path:
     return report
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "data_dir",
+        nargs="?",
+        default=str(DEFAULT_DATA),
+        help="Directory containing input rasters",
+    )
+    parser.add_argument(
+        "--encode-only",
+        action="store_true",
+        help="Run only fastcog encode benchmarks (skip info/crop/band/remux)",
+    )
+    parser.add_argument(
+        "--job-timeout-s",
+        type=float,
+        default=DEFAULT_JOB_TIMEOUT_S,
+        help=f"Kill jobs that exceed this wall time (default: {DEFAULT_JOB_TIMEOUT_S:.0f}s)",
+    )
+    parser.add_argument(
+        "--fastinfo-runs",
+        type=int,
+        default=None,
+        help="Override fastinfo/gdalinfo repeat count (default: 3, or 1 for heavy datasets)",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove existing benchmark output directory before running",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
-    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_DATA
+    args = parse_args()
+    data_dir = Path(args.data_dir)
     if not data_dir.is_dir():
         print(f"error: {data_dir} not found", file=sys.stderr)
         return 1
+
+    if args.clean and OUT_ROOT.exists():
+        shutil.rmtree(OUT_ROOT)
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     for binary in ("fastcog", "fastcrop", "fastband", "fastinfo", "fastvalidate", "fasttranslate"):
         if not (BIN / binary).exists():
@@ -358,29 +446,37 @@ def main() -> int:
         return 1
 
     results: list[PairResult] = []
-    print(f"Resource benchmark: {len(files)} datasets -> {OUT_ROOT}\n")
+    print(f"Resource benchmark: {len(files)} datasets -> {OUT_ROOT}")
+    print(f"Job timeout: {args.job_timeout_s:.0f}s, encode_only={args.encode_only}\n")
 
     for path in files:
         slug = slugify(path)
         w, h, bands = probe(path)
         heavy = w * h > 150_000_000 or path.stat().st_size > 400_000_000
         runs = 1 if heavy else 2
+        fastinfo_runs = (
+            args.fastinfo_runs
+            if args.fastinfo_runs is not None
+            else (FASTINFO_RUNS_HEAVY if heavy else FASTINFO_RUNS)
+        )
         ds_dir = OUT_ROOT / slug
         ds_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[{slug}] {w}x{h}, {bands}b, heavy={heavy}")
 
-        pair_bench(
-            results,
-            slug,
-            "fastinfo",
-            "metadata",
-            [str(BIN / "fastinfo"), str(path)],
-            ["gdalinfo", str(path)],
-            None,
-            None,
-            runs=20,
-        )
+        if not args.encode_only:
+            pair_bench(
+                results,
+                slug,
+                "fastinfo",
+                "metadata",
+                [str(BIN / "fastinfo"), str(path)],
+                ["gdalinfo", str(path)],
+                None,
+                None,
+                runs=fastinfo_runs,
+                timeout_s=args.job_timeout_s,
+            )
 
         cog_fast = ds_dir / "to_cog_fast.tif"
         cog_gdal = ds_dir / "to_cog_gdal.tif"
@@ -394,7 +490,11 @@ def main() -> int:
             cog_fast,
             cog_gdal,
             runs=runs,
+            timeout_s=args.job_timeout_s,
         )
+
+        if args.encode_only:
+            continue
 
         cog_source = (
             cog_gdal

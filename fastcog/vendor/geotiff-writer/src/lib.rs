@@ -29,8 +29,8 @@ pub use builder::GeoTiffBuilder;
 pub use cog::{
     collect_planar_packed_u8, pack_u8_planar_tile, remux_compress_tile, CogBuilder, CogTileWriter,
     LayerEncodePlan, OverviewStorage, PackedPlanarTile, PlanarCogStream, RemuxCompressedBlock,
-    RemuxLayer, RemuxMaskDescriptor, RemuxTileEncoding, Resampling, StreamingRgbCogLayerWriter,
-    StreamingRgbCogWriter,
+    RemuxLayer, RemuxMaskDescriptor, RemuxTileEncoding, Resampling, StreamingCogLayerSpec,
+    StreamingRgbCogLayerWriter, StreamingRgbCogWriter,
 };
 pub use error::{Error, Result};
 pub use sample::{NumericSample, WriteSample};

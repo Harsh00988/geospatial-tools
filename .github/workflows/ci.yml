@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gdal-alt-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenjp2-7-dev
+
+      - name: Test gdal-alt-core
+        run: cargo test -p gdal-alt-core
+
+      - name: Encode smoke (in-process fixtures)
+        run: cargo test -p gdal-alt-core --test encode_smoke
+
+      - name: Build CLI binaries for optional fixture smoke
+        run: cargo build --release -p fastcog -p fastvalidate
+
+      - name: CLI encode smoke (when test_data fixtures are present)
+        run: |
+          if compgen -G "test_data/*.{tif,tiff}" > /dev/null; then
+            FIXTURE_DIR=test_data ./scripts/run_encode_smoke.sh
+          else
+            echo "No committed test_data fixtures; in-process smoke already passed"
+          fi
