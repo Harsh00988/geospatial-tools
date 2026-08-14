@@ -7,9 +7,9 @@ use tiff_core::Compression;
 use tiff_core::SampleFormat;
 
 use crate::geo;
-use crate::input::{detect, detect_source, InputFormat};
+use crate::input::{detect_source, InputFormat};
 use crate::jp2::Jp2Header;
-use crate::open::{open_geotiff, open_input};
+use crate::open::open_input;
 use crate::util;
 
 #[derive(Debug, Clone)]

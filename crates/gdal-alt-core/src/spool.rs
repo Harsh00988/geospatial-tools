@@ -171,33 +171,6 @@ impl PendingBlockStore {
     }
 }
 
-/// Target for parallel out-of-order encoded COG tile blocks.
-pub trait StreamingEncodeSink: Sync {
-    fn block_count(&self) -> usize;
-    fn write_block(&self, index: usize, block: RemuxCompressedBlock) -> Result<()>;
-}
-
-impl StreamingEncodeSink for StreamingLayerWriter {
-    fn block_count(&self) -> usize {
-        self.block_count()
-    }
-
-    fn write_block(&self, index: usize, block: RemuxCompressedBlock) -> Result<()> {
-        StreamingLayerWriter::write_block(self, index, block)
-    }
-}
-
-impl StreamingEncodeSink for geotiff_writer::StreamingRgbCogLayerWriter {
-    fn block_count(&self) -> usize {
-        self.block_count()
-    }
-
-    fn write_block(&self, index: usize, block: RemuxCompressedBlock) -> Result<()> {
-        self.write_block(index, block)
-            .map_err(|err| anyhow::anyhow!(err))
-    }
-}
-
 /// Parallel-safe writer that orders blocks and writes once directly into the spool file.
 pub struct StreamingLayerWriter {
     tx: Option<Sender<BlockMsg>>,

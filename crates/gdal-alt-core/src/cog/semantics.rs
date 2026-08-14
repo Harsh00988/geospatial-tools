@@ -22,7 +22,7 @@ pub fn detect_transparency(
         return TransparencySource::DatasetMask;
     }
     if mask_from_alpha {
-        if let Some(index) = associated_alpha_band_index(profile) {
+        if associated_alpha_band_index(profile).is_some() {
             return TransparencySource::AssociatedAlpha;
         }
     }
@@ -73,11 +73,4 @@ where
     }
     let value = trimmed.parse::<f64>().ok()?;
     T::try_from_f64(value)
-}
-
-pub fn is_nodata<T>(value: T, nodata: Option<T>) -> bool
-where
-    T: PartialEq,
-{
-    nodata.is_some_and(|nd| value == nd)
 }

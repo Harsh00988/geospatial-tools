@@ -219,7 +219,6 @@ struct PlannedCogImage {
 
 struct CogLayout {
     base_offset: u64,
-    data_start: u64,
     is_bigtiff: bool,
     images: Vec<PlannedCogImage>,
 }
@@ -748,7 +747,6 @@ fn plan_cog_layout_for_variant(
 
     Ok(CogLayout {
         base_offset,
-        data_start,
         is_bigtiff,
         images: image_plans,
     })
@@ -2961,7 +2959,7 @@ impl CogBuilder {
         &self,
         path: P,
         rgb_layer_count: usize,
-        mut read_block: R,
+        read_block: R,
     ) -> Result<()>
     where
         T: NumericSample,
@@ -2980,7 +2978,7 @@ impl CogBuilder {
     /// Write a remuxed COG to any `Write + Seek` target, loading RGB layers on demand.
     pub fn remux_rgb_layers_from_reader_to<T, W, R>(
         &self,
-        mut sink: W,
+        sink: W,
         rgb_layer_count: usize,
         mut read_layer: R,
     ) -> Result<W>

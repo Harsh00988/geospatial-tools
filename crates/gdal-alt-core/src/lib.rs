@@ -1,6 +1,6 @@
 pub mod cog;
 pub mod crop;
-pub mod encode_overview;
+pub mod encode;
 pub mod geo;
 pub mod info;
 pub mod input;
@@ -14,8 +14,6 @@ pub mod resample;
 pub mod remux;
 pub mod spool;
 pub mod stats;
-pub mod strip_encode;
-pub mod tiled_encode;
 pub mod transcode;
 pub mod util;
 pub mod validate;

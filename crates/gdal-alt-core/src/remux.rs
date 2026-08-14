@@ -160,7 +160,7 @@ fn try_strip_to_tiled_remux(
     let window_owned = window.cloned();
     match (profile.sample.bits_per_sample, profile.sample.sample_format) {
         (8, SampleFormat::Uint) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<u8>(
+            crate::encode::convert_to_remux_cog::<u8>(
                 pool,
                 input,
                 output,
@@ -172,7 +172,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (8, SampleFormat::Int) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<i8>(
+            crate::encode::convert_to_remux_cog::<i8>(
                 pool,
                 input,
                 output,
@@ -184,7 +184,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (16, SampleFormat::Uint) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<u16>(
+            crate::encode::convert_to_remux_cog::<u16>(
                 pool,
                 input,
                 output,
@@ -196,7 +196,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (16, SampleFormat::Int) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<i16>(
+            crate::encode::convert_to_remux_cog::<i16>(
                 pool,
                 input,
                 output,
@@ -208,7 +208,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (32, SampleFormat::Uint) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<u32>(
+            crate::encode::convert_to_remux_cog::<u32>(
                 pool,
                 input,
                 output,
@@ -220,7 +220,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (32, SampleFormat::Int) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<i32>(
+            crate::encode::convert_to_remux_cog::<i32>(
                 pool,
                 input,
                 output,
@@ -232,7 +232,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (32, SampleFormat::Float) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<f32>(
+            crate::encode::convert_to_remux_cog::<f32>(
                 pool,
                 input,
                 output,
@@ -244,7 +244,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (64, SampleFormat::Uint) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<u64>(
+            crate::encode::convert_to_remux_cog::<u64>(
                 pool,
                 input,
                 output,
@@ -256,7 +256,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (64, SampleFormat::Int) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<i64>(
+            crate::encode::convert_to_remux_cog::<i64>(
                 pool,
                 input,
                 output,
@@ -268,7 +268,7 @@ fn try_strip_to_tiled_remux(
             )?;
         }
         (64, SampleFormat::Float) => {
-            crate::strip_encode::convert_strip_to_remux_cog::<f64>(
+            crate::encode::convert_to_remux_cog::<f64>(
                 pool,
                 input,
                 output,

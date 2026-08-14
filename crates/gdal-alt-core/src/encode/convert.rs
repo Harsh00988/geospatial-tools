@@ -4,13 +4,15 @@ use tiff_reader::TiffSample;
 
 use crate::cog::{configure_cog, overview_levels, CogOutputOptions};
 use crate::crop::WriteWindow;
-use crate::encode_overview::{encode_layers_with_spool, encode_overview_layers_to_streaming_cog};
+use crate::encode::overview::{encode_layers_with_spool, encode_overview_layers};
+use crate::encode::sink::StreamingCogSink;
+use crate::encode::strip::{encode_row_group_total, output_tile_encoding};
 use crate::input::RasterProfile;
 use crate::progress::ProgressTracker;
 use crate::remux::{encode_output_needs_mask_remux, remux_encoded_layers_from_spool};
-use crate::strip_encode::{encode_row_group_total, output_tile_encoding};
 
-pub fn convert_tiled_to_remux_cog<T>(
+/// Encode a GeoTIFF (strip or tiled input) into a remux COG.
+pub fn convert_to_remux_cog<T>(
     pool: &rayon::ThreadPool,
     input: &GeoTiffFile,
     output: &std::path::Path,
@@ -67,9 +69,10 @@ where
         let cog = configure_cog(profile.base_builder(opts), opts, width, height);
         let stream = cog.open_streaming_rgb_writer::<T, _>(output, 1 + levels.len())?;
         pool.install(|| {
-            encode_overview_layers_to_streaming_cog::<T>(
+            let mut sink = StreamingCogSink(&stream);
+            encode_overview_layers::<T, _>(
                 input,
-                &stream,
+                &mut sink,
                 width,
                 height,
                 tile_size,

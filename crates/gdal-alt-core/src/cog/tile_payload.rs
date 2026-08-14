@@ -254,10 +254,6 @@ pub fn input_compression(ifd: &Ifd) -> Compression {
     Compression::from_code(ifd.compression()).unwrap_or(Compression::None)
 }
 
-pub fn ifd_predictor(ifd: &Ifd) -> u16 {
-    ifd.predictor()
-}
-
 pub fn ifd_planar(ifd: &Ifd) -> PlanarConfiguration {
     PlanarConfiguration::from_code(ifd.planar_configuration())
         .unwrap_or(PlanarConfiguration::Chunky)
