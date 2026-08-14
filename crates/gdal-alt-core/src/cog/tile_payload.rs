@@ -56,6 +56,7 @@ pub fn read_layer_block_at(
     })
 }
 
+
 pub fn read_layer_blocks(tiff: &TiffFile, ifd: &Ifd) -> Result<Vec<RemuxCompressedBlock>> {
     let offsets = ifd
         .tile_offsets()
@@ -266,6 +267,83 @@ pub fn ifd_sample_format(ifd: &Ifd) -> Result<SampleFormat> {
     let codes = ifd.sample_format()?;
     let code = *codes.first().unwrap_or(&1);
     SampleFormat::from_code(code).ok_or_else(|| anyhow::anyhow!("unsupported sample format {code}"))
+}
+
+/// True when compressed tile/strip payloads can be copied verbatim into the output COG layer.
+pub fn layer_blocks_copyable(
+    ifd: &Ifd,
+    opts: &crate::cog::CogOutputOptions,
+    sample_format: SampleFormat,
+) -> bool {
+    if !compression_matches_ifd(ifd, opts) {
+        return false;
+    }
+    if !predictor_matches_ifd(ifd, opts, sample_format) {
+        return false;
+    }
+    let (tile_w, tile_h) = match (ifd.tile_width(), ifd.tile_height()) {
+        (Some(w), Some(h)) => (w, h),
+        _ => return false,
+    };
+    tile_w == opts.blocksize && tile_h == opts.blocksize
+}
+
+pub(crate) fn compression_matches_ifd(
+    ifd: &Ifd,
+    opts: &crate::cog::CogOutputOptions,
+) -> bool {
+    opts.compression.to_compression() == input_compression(ifd)
+}
+
+pub(crate) fn predictor_matches_ifd(
+    ifd: &Ifd,
+    opts: &crate::cog::CogOutputOptions,
+    sample_format: SampleFormat,
+) -> bool {
+    use tiff_core::Predictor;
+    let src = Predictor::from_code(ifd.predictor()).unwrap_or(Predictor::None);
+    let dst = opts.encode_predictor_for(sample_format);
+    src == dst
+}
+
+#[cfg(test)]
+mod copyable_tests {
+    use crate::cog::{CompressionChoice, CogOutputOptions, LercAdditionalCompressionChoice, ResamplingChoice};
+    use tiff_core::{Compression, Predictor, SampleFormat};
+
+    fn opts(compression: CompressionChoice, blocksize: u32) -> CogOutputOptions {
+        CogOutputOptions {
+            blocksize,
+            compression,
+            deflate_level: 6,
+            resampling: ResamplingChoice::Average,
+            overview_levels: None,
+            no_overviews: false,
+            mask_from_alpha: true,
+            black_rgb_transparent: false,
+            jpeg_quality: 75,
+            lerc_max_z_error: 0.0,
+            lerc_additional_compression: LercAdditionalCompressionChoice::None,
+        }
+    }
+
+    #[test]
+    fn deflate_opts_match_deflate_compression() {
+        assert_eq!(
+            opts(CompressionChoice::Deflate, 512).compression.to_compression(),
+            Compression::Deflate
+        );
+    }
+
+    #[test]
+    fn encode_predictor_none_for_float_even_with_deflate() {
+        let o = opts(CompressionChoice::Deflate, 512);
+        assert_eq!(o.encode_predictor_for(SampleFormat::Float), Predictor::None);
+        assert_eq!(
+            o.encode_predictor_for(SampleFormat::Uint),
+            Predictor::Horizontal
+        );
+    }
 }
 
 pub fn collect_remux_layers(

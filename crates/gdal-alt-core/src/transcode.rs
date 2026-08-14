@@ -3,9 +3,10 @@ use geotiff_reader::GeoTiffFile;
 use geotiff_writer::{remux_compress_tile, RemuxCompressedBlock, RemuxTileEncoding};
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
-use tiff_core::{PlanarConfiguration, Predictor};
+use tiff_core::{PlanarConfiguration, SampleFormat};
 use tiff_reader::TiffSample;
 
+use crate::cog::tile_payload::{layer_blocks_copyable, read_layer_blocks};
 use crate::cog::tile_payload::ifd_planar;
 use crate::cog::{tile_jobs, CogOutputOptions, TileJob};
 use crate::remux::layer_ifd;
@@ -19,35 +20,50 @@ where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
 {
     let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
-    let tile_size = base_ifd.tile_width().unwrap_or(opts.blocksize) as usize;
+    let tile_size = opts.blocksize as usize;
     let bands = profile.bands as usize;
     let planar = ifd_planar(base_ifd) == PlanarConfiguration::Planar || bands == 1;
     let layer_count = 1 + input.overview_count();
+    let sample_format = profile.sample.sample_format;
 
     (0..layer_count)
         .into_par_iter()
         .map(|layer_index| {
-            if planar {
-                build_planar_transcode_layer::<T>(
-                    input,
-                    layer_index,
-                    opts,
-                    tile_size,
-                    bands,
-                    profile.sample.sample_format,
-                )
-            } else {
-                build_chunky_transcode_layer::<T>(
-                    input,
-                    layer_index,
-                    opts,
-                    tile_size,
-                    bands,
-                    profile.sample.sample_format,
-                )
-            }
+            build_transcode_layer::<T>(
+                input,
+                layer_index,
+                opts,
+                tile_size,
+                bands,
+                planar,
+                sample_format,
+            )
         })
         .collect()
+}
+
+pub(crate) fn build_transcode_layer<T>(
+    input: &GeoTiffFile,
+    layer_index: usize,
+    opts: &CogOutputOptions,
+    tile_size: usize,
+    bands: usize,
+    planar: bool,
+    sample_format: SampleFormat,
+) -> Result<Vec<RemuxCompressedBlock>>
+where
+    T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
+{
+    let ifd = layer_ifd(input, layer_index)?;
+    if layer_blocks_copyable(ifd, opts, sample_format) {
+        return read_layer_blocks(input.tiff(), ifd);
+    }
+
+    if planar {
+        build_planar_transcode_layer::<T>(input, layer_index, opts, tile_size, bands, sample_format)
+    } else {
+        build_chunky_transcode_layer::<T>(input, layer_index, opts, tile_size, bands, sample_format)
+    }
 }
 
 fn build_planar_transcode_layer<T>(
@@ -56,7 +72,7 @@ fn build_planar_transcode_layer<T>(
     opts: &CogOutputOptions,
     tile_size: usize,
     bands: usize,
-    sample_format: tiff_core::SampleFormat,
+    sample_format: SampleFormat,
 ) -> Result<Vec<RemuxCompressedBlock>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -94,7 +110,7 @@ fn build_chunky_transcode_layer<T>(
     opts: &CogOutputOptions,
     tile_size: usize,
     bands: usize,
-    sample_format: tiff_core::SampleFormat,
+    sample_format: SampleFormat,
 ) -> Result<Vec<RemuxCompressedBlock>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
@@ -204,7 +220,7 @@ fn output_tile_encoding(
     opts: &CogOutputOptions,
     tile_size: usize,
     spp: u16,
-    sample_format: tiff_core::SampleFormat,
+    sample_format: SampleFormat,
 ) -> RemuxTileEncoding {
     crate::cog::tile_encoding_from_opts(opts, tile_size, spp, None, sample_format)
 }

@@ -13,12 +13,14 @@ use crate::cog::{
     configure_cog, configure_cog_with_layer_sizes, configure_cog_with_layer_sizes_masked,
     auto_overview_levels, overview_levels, CogOutputOptions,
 };
-use crate::cog::mask::prepare_remux_layers;
+use crate::cog::mask::{discover_dataset_masks, prepare_remux_layers};
+use crate::cog::semantics::{detect_transparency, TransparencySource};
 use crate::crop::WriteWindow;
 use crate::input::RasterProfile;
 use crate::open::open_geotiff;
 use crate::path::ConvertPath;
 use crate::progress::{ProgressTracker, StageBar};
+use crate::spool::{LayerBlockReader, LayerBlockSpool};
 use crate::util::ensure_parent_dir;
 
 /// Attempt a fast COG rewrite without decoding pixels.
@@ -357,9 +359,6 @@ pub(crate) fn best_source_overview(source_factors: &[u32], target_level: u32) ->
         .map(|(index, &factor)| (index, factor))
 }
 
-/// Resolve which source pyramid layer to read when building a target overview level.
-/// Returns `(layer_index, source_factor, downsample)` where `layer_index` is 0 for base
-/// and 1+ for overview IFDs, and `downsample` is the extra reduction after the read.
 pub(crate) fn resolve_overview_read_source(
     input: &GeoTiffFile,
     level: u32,
@@ -679,6 +678,181 @@ fn remux_with_layers(
         overview_sizes,
         show_progress,
     )
+}
+
+pub(crate) fn encode_output_needs_mask_remux(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+) -> bool {
+    if discover_dataset_masks(input).is_some() {
+        return true;
+    }
+    matches!(
+        detect_transparency(
+            input,
+            profile,
+            opts.mask_from_alpha,
+            opts.black_rgb_transparent,
+        ),
+        TransparencySource::AssociatedAlpha | TransparencySource::BlackRgb
+    )
+}
+
+pub(crate) fn remux_encoded_layers_from_spool(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    opts: &CogOutputOptions,
+    mut spool: LayerBlockSpool,
+    output: &Path,
+    window: Option<&WriteWindow>,
+    mut overview_levels: Option<Vec<u32>>,
+    mut overview_sizes: Option<Vec<(u32, u32)>>,
+    show_progress: bool,
+) -> Result<()> {
+    if encode_output_needs_mask_remux(input, profile, opts) {
+        return remux_encoded_layers(
+            input,
+            profile,
+            opts,
+            spool.read_all_layers()?,
+            output,
+            window,
+            overview_levels,
+            overview_sizes,
+            show_progress,
+        );
+    }
+
+    let layer_count = spool.layer_count();
+    let target_overviews = layer_count.saturating_sub(1);
+    if let Some(levels) = overview_levels.as_mut() {
+        levels.truncate(target_overviews);
+    }
+    if let Some(sizes) = overview_sizes.as_mut() {
+        sizes.truncate(target_overviews);
+    }
+    if overview_levels.is_none() && target_overviews > 0 {
+        overview_levels = Some(
+            auto_overview_levels(profile.width, profile.height, opts.blocksize)
+                .into_iter()
+                .take(target_overviews)
+                .collect(),
+        );
+    }
+
+    let cog = match (overview_levels, overview_sizes) {
+        (Some(levels), Some(sizes)) => configure_cog_with_layer_sizes(
+            profile.base_builder(opts),
+            opts,
+            levels,
+            sizes,
+        ),
+        (Some(levels), None) => {
+            crate::cog::configure_cog_with_levels(profile.base_builder(opts), opts, levels)
+        }
+        _ => configure_cog(profile.base_builder(opts), opts, profile.width, profile.height),
+    };
+
+    let progress = ProgressTracker::new(show_progress);
+    let write_bar = progress.stage("Write COG", 1);
+
+    spool.rewind()?;
+    let mut source = SpoolBlockSource {
+        reader: spool.block_reader(),
+        current_layer: None,
+        next_block: 0,
+    };
+    let result = remux_spool_reader_to_file(
+        &cog,
+        &mut source,
+        output,
+        layer_count,
+        profile.sample.bits_per_sample,
+        profile.sample.sample_format,
+    )
+    .map_err(|err| anyhow::anyhow!(err));
+
+    write_bar.inc(1);
+    write_bar.done("done");
+    progress.finish();
+    result
+}
+
+struct SpoolBlockSource {
+    reader: LayerBlockReader,
+    current_layer: Option<usize>,
+    next_block: usize,
+}
+
+fn remux_spool_reader_to_file(
+    cog: &geotiff_writer::CogBuilder,
+    source: &mut SpoolBlockSource,
+    output: &Path,
+    layer_count: usize,
+    bits_per_sample: u16,
+    sample_format: SampleFormat,
+) -> std::result::Result<(), geotiff_writer::Error> {
+    macro_rules! dispatch {
+        ($t:ty) => {
+            return cog.remux_rgb_layers_from_block_reader::<$t, _, _>(
+                output,
+                layer_count,
+                |layer, block| source.read(layer, block),
+            )
+        };
+    }
+
+    match (bits_per_sample, sample_format) {
+        (8, SampleFormat::Uint) => dispatch!(u8),
+        (8, SampleFormat::Int) => dispatch!(i8),
+        (16, SampleFormat::Uint) => dispatch!(u16),
+        (16, SampleFormat::Int) => dispatch!(i16),
+        (32, SampleFormat::Uint) => dispatch!(u32),
+        (32, SampleFormat::Int) => dispatch!(i32),
+        (32, SampleFormat::Float) => dispatch!(f32),
+        (64, SampleFormat::Uint) => dispatch!(u64),
+        (64, SampleFormat::Int) => dispatch!(i64),
+        (64, SampleFormat::Float) => dispatch!(f64),
+        _ => Err(geotiff_writer::Error::Other(
+            "unsupported sample layout for remux".into(),
+        )),
+    }
+}
+
+impl SpoolBlockSource {
+    fn read(
+        &mut self,
+        layer: usize,
+        block: usize,
+    ) -> std::result::Result<RemuxCompressedBlock, geotiff_writer::Error> {
+        let err = |msg: String| geotiff_writer::Error::Other(msg);
+        if self.current_layer != Some(layer) {
+            if block != 0 {
+                return Err(err(format!(
+                    "spool reader expected block 0 of layer {layer}, got block {block}"
+                )));
+            }
+            self.reader
+                .begin_layer()
+                .map_err(|e| err(e.to_string()))?;
+            self.current_layer = Some(layer);
+            self.next_block = 0;
+        } else if self.next_block != block {
+            return Err(err(format!(
+                "spool reader expected block {} of layer {layer}, got block {block}",
+                self.next_block
+            )));
+        }
+
+        let out = self
+            .reader
+            .read_block()
+            .map_err(|e| err(e.to_string()))?
+            .ok_or_else(|| err(format!("missing block {block} in layer {layer}")))?;
+        self.next_block += 1;
+        Ok(out)
+    }
 }
 
 pub(crate) fn remux_encoded_layers(

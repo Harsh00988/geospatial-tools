@@ -15,6 +15,8 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 
 use ndarray::{ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
@@ -217,6 +219,7 @@ struct PlannedCogImage {
 
 struct CogLayout {
     base_offset: u64,
+    data_start: u64,
     is_bigtiff: bool,
     images: Vec<PlannedCogImage>,
 }
@@ -745,6 +748,7 @@ fn plan_cog_layout_for_variant(
 
     Ok(CogLayout {
         base_offset,
+        data_start,
         is_bigtiff,
         images: image_plans,
     })
@@ -772,12 +776,105 @@ fn plan_cog_layout(
     }
 }
 
+fn compute_cog_header_end(
+    base_offset: u64,
+    prefix_len: u64,
+    images: &[CogImage],
+    is_bigtiff: bool,
+) -> Result<u64> {
+    let mut current = checked_add_u64(
+        checked_add_u64(
+            base_offset,
+            encoder::header_len(is_bigtiff),
+            "COG header size",
+        )?,
+        prefix_len,
+        "COG prefix size",
+    )?;
+    for image in images {
+        let tags = build_cog_image_tags(image, is_bigtiff)?;
+        current = checked_add_u64(
+            current,
+            encoder::estimate_ifd_size(ByteOrder::LittleEndian, is_bigtiff, &tags)?,
+            "COG IFD layout",
+        )?;
+        if !is_bigtiff {
+            u32::try_from(current).map_err(|_| {
+                Error::Tiff(tiff_writer::Error::ClassicOffsetOverflow { offset: current })
+            })?;
+        }
+    }
+    Ok(current)
+}
+
+fn resolve_cog_data_start(
+    base_offset: u64,
+    prefix_len: u64,
+    variant: TiffVariant,
+    images: &[CogImage],
+) -> Result<(bool, u64)> {
+    match variant {
+        TiffVariant::Classic => Ok((false, compute_cog_header_end(base_offset, prefix_len, images, false)?)),
+        TiffVariant::BigTiff => Ok((true, compute_cog_header_end(base_offset, prefix_len, images, true)?)),
+        TiffVariant::Auto => match compute_cog_header_end(base_offset, prefix_len, images, false) {
+            Ok(data_start) => Ok((false, data_start)),
+            Err(Error::Tiff(tiff_writer::Error::ClassicOffsetOverflow { .. })) => Ok((
+                true,
+                compute_cog_header_end(base_offset, prefix_len, images, true)?,
+            )),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+fn wrapped_block_physical_len(payload_len: usize) -> Result<u64> {
+    let leader_len = checked_len_u64(4, "COG block leader")?;
+    let payload_len = checked_len_u64(payload_len, "COG block payload")?;
+    let trailer_len = checked_len_u64(4, "COG block trailer")?;
+    checked_add_u64(
+        checked_add_u64(leader_len, payload_len, "COG block size")?,
+        trailer_len,
+        "COG block size",
+    )
+}
+
+fn write_wrapped_remux_block<W: Write + Seek>(
+    sink: &mut W,
+    physical_start: u64,
+    spool_offset: u64,
+    block: &RemuxCompressedBlock,
+    byte_order: ByteOrder,
+) -> Result<CogBlockRecord> {
+    if block.sparse || block.payload.is_empty() {
+        return Ok(CogBlockRecord {
+            spool_offset: 0,
+            logical_offset_delta: 0,
+            logical_byte_count: 0,
+            sparse: true,
+        });
+    }
+    let leader_len = checked_len_u64(4, "COG block leader")?;
+    let payload_len = checked_len_u64(block.payload.len(), "COG block payload")?;
+    sink.seek(SeekFrom::Start(physical_start))?;
+    let leader = gdal_block_leader(block.payload.len(), byte_order)?;
+    let trailer = gdal_block_trailer(&block.payload);
+    sink.write_all(&leader)?;
+    sink.write_all(&block.payload)?;
+    sink.write_all(&trailer)?;
+    Ok(CogBlockRecord {
+        spool_offset,
+        logical_offset_delta: leader_len,
+        logical_byte_count: payload_len,
+        sparse: false,
+    })
+}
+
 fn emit_cog<W: Write + Seek>(
     sink: &mut W,
     prefix: &[u8],
     images: &[CogImage],
     layout: &CogLayout,
-    spool: &mut BlockSpool,
+    spool: Option<&mut BlockSpool>,
 ) -> Result<()> {
     sink.seek(SeekFrom::Start(layout.base_offset))?;
     encoder::write_header(sink, ByteOrder::LittleEndian, layout.is_bigtiff)?;
@@ -918,7 +1015,9 @@ fn emit_cog<W: Write + Seek>(
     }
 
     sink.seek(SeekFrom::End(0))?;
-    spool.copy_into(sink)?;
+    if let Some(spool) = spool {
+        spool.copy_into(sink)?;
+    }
     Ok(())
 }
 
@@ -1052,6 +1151,50 @@ impl CogBuilder {
         for (index, &level) in overview_levels.iter().enumerate() {
             images.push(CogImage {
                 builder: self.overview_image_builder::<T>(level, tile_width, tile_height, index)?,
+                mask: None,
+                blocks: Vec::new(),
+                sub_ifd_count: 0,
+            });
+        }
+        Ok(images)
+    }
+
+    fn build_remux_rgb_cog_images<T: NumericSample>(
+        &self,
+        rgb_layer_count: usize,
+        overview_levels: &[u32],
+        tile_width: u32,
+        tile_height: u32,
+    ) -> Result<Vec<CogImage>> {
+        if rgb_layer_count == 0 {
+            return Err(Error::Other("remux requires at least one RGB layer".into()));
+        }
+        if rgb_layer_count != 1 + overview_levels.len() {
+            return Err(Error::Other(format!(
+                "remux expected {} RGB layers, got {rgb_layer_count}",
+                1 + overview_levels.len()
+            )));
+        }
+
+        let mut images = Vec::with_capacity(rgb_layer_count);
+        images.push(CogImage {
+            builder: self.inner.to_image_builder::<T>()?,
+            mask: None,
+            blocks: Vec::new(),
+            sub_ifd_count: if matches!(self.overview_storage, OverviewStorage::SubIfds) {
+                overview_levels.len()
+            } else {
+                0
+            },
+        });
+        for (overview_index, &level) in overview_levels.iter().enumerate() {
+            images.push(CogImage {
+                builder: self.overview_image_builder::<T>(
+                    level,
+                    tile_width,
+                    tile_height,
+                    overview_index,
+                )?,
                 mask: None,
                 blocks: Vec::new(),
                 sub_ifd_count: 0,
@@ -1237,7 +1380,7 @@ impl CogBuilder {
             self.inner.tiff_variant,
             &images,
         )?;
-        emit_cog(&mut sink, &prefix, &images, &layout, &mut spool)?;
+        emit_cog(&mut sink, &prefix, &images, &layout, Some(&mut spool))?;
         Ok(())
     }
 
@@ -1339,7 +1482,7 @@ impl CogBuilder {
             self.inner.tiff_variant,
             &images,
         )?;
-        emit_cog(&mut sink, &prefix, &images, &layout, &mut spool)?;
+        emit_cog(&mut sink, &prefix, &images, &layout, Some(&mut spool))?;
         Ok(())
     }
 
@@ -1489,7 +1632,7 @@ impl CogBuilder {
             self.inner.tiff_variant,
             &images,
         )?;
-        emit_cog(&mut sink, &prefix, &images, &layout, &mut spool)?;
+        emit_cog(&mut sink, &prefix, &images, &layout, Some(&mut spool))?;
         Ok(())
     }
 
@@ -1625,7 +1768,7 @@ impl<W: Write + Seek> PlanarCogStream<W> {
             &self.prefix,
             &self.images,
             &layout,
-            &mut self.spool,
+            Some(&mut self.spool),
         )?;
         Ok(self.sink)
     }
@@ -1994,7 +2137,7 @@ impl<T: NumericSample, W: Write + Seek> CogTileWriter<T, W> {
             self.cog.inner.tiff_variant,
             &images,
         )?;
-        emit_cog(&mut self.sink, &prefix, &images, &layout, &mut spool)?;
+        emit_cog(&mut self.sink, &prefix, &images, &layout, Some(&mut spool))?;
         Ok(self.sink)
     }
 }
@@ -2792,6 +2935,157 @@ impl CogBuilder {
         self.remux_layers_to_file::<T, P>(path, layers)
     }
 
+    /// Write a remuxed COG by reading one RGB layer at a time (lower peak RAM).
+    pub fn remux_rgb_layers_from_reader<T, P, R>(
+        &self,
+        path: P,
+        rgb_layer_count: usize,
+        read_layer: R,
+    ) -> Result<()>
+    where
+        T: NumericSample,
+        P: AsRef<Path>,
+        R: FnMut(usize) -> Result<Vec<RemuxCompressedBlock>>,
+    {
+        let file = File::create(path)?;
+        self.remux_rgb_layers_from_reader_to::<T, _, _>(
+            BufWriter::with_capacity(REMUX_OUTPUT_BUFFER_BYTES, file),
+            rgb_layer_count,
+            read_layer,
+        )?;
+        Ok(())
+    }
+
+    /// Write a remuxed COG by reading one compressed block at a time (lowest peak RAM).
+    pub fn remux_rgb_layers_from_block_reader<T, P, R>(
+        &self,
+        path: P,
+        rgb_layer_count: usize,
+        mut read_block: R,
+    ) -> Result<()>
+    where
+        T: NumericSample,
+        P: AsRef<Path>,
+        R: FnMut(usize, usize) -> Result<RemuxCompressedBlock>,
+    {
+        let file = File::create(path)?;
+        self.remux_rgb_layers_from_block_reader_to::<T, _, _>(
+            BufWriter::with_capacity(REMUX_OUTPUT_BUFFER_BYTES, file),
+            rgb_layer_count,
+            read_block,
+        )?;
+        Ok(())
+    }
+
+    /// Write a remuxed COG to any `Write + Seek` target, loading RGB layers on demand.
+    pub fn remux_rgb_layers_from_reader_to<T, W, R>(
+        &self,
+        mut sink: W,
+        rgb_layer_count: usize,
+        mut read_layer: R,
+    ) -> Result<W>
+    where
+        T: NumericSample,
+        W: Write + Seek,
+        R: FnMut(usize) -> Result<Vec<RemuxCompressedBlock>>,
+    {
+        let cache = std::cell::RefCell::new((usize::MAX, Option::<Vec<RemuxCompressedBlock>>::None));
+        self.remux_rgb_layers_from_block_reader_to::<T, W, _>(
+            sink,
+            rgb_layer_count,
+            |layer, block_idx| {
+                let mut cached = cache.borrow_mut();
+                if cached.0 != layer {
+                    cached.1 = Some(read_layer(layer)?);
+                    cached.0 = layer;
+                }
+                cached
+                    .1
+                    .as_ref()
+                    .and_then(|blocks| blocks.get(block_idx))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Other(format!("missing block {block_idx} in layer {layer}"))
+                    })
+            },
+        )
+    }
+
+    /// Write a remuxed COG to any `Write + Seek` target, loading one block at a time.
+    pub fn remux_rgb_layers_from_block_reader_to<T, W, R>(
+        &self,
+        mut sink: W,
+        rgb_layer_count: usize,
+        mut read_block: R,
+    ) -> Result<W>
+    where
+        T: NumericSample,
+        W: Write + Seek,
+        R: FnMut(usize, usize) -> Result<RemuxCompressedBlock>,
+    {
+        let overview_levels = self.normalized_overview_levels()?;
+        let tile_width = self.inner.tile_width.unwrap_or(256);
+        let tile_height = self.inner.tile_height.unwrap_or(256);
+        let mut images = self.build_remux_rgb_cog_images::<T>(
+            rgb_layer_count,
+            &overview_levels,
+            tile_width,
+            tile_height,
+        )?;
+        let prefix = gdal_structural_metadata_bytes(self.inner.planar_configuration);
+        let byte_order = ByteOrder::LittleEndian;
+        let base_offset = sink.stream_position()?;
+        let prefix_len = checked_len_u64(prefix.len(), "COG prefix")?;
+        let (is_bigtiff, data_start) =
+            resolve_cog_data_start(base_offset, prefix_len, self.inner.tiff_variant, &images)?;
+
+        let mut tile_tail = 0u64;
+        for (layer_index, image) in images.iter_mut().enumerate() {
+            let expected = image.checked_block_count()?;
+            let mut records = Vec::with_capacity(expected);
+            for block_idx in 0..expected {
+                let block = read_block(layer_index, block_idx)?;
+                if block.sparse || block.payload.is_empty() {
+                    records.push(CogBlockRecord {
+                        spool_offset: 0,
+                        logical_offset_delta: 0,
+                        logical_byte_count: 0,
+                        sparse: true,
+                    });
+                    continue;
+                }
+                let physical_start = checked_add_u64(
+                    data_start,
+                    tile_tail,
+                    "COG block physical offset",
+                )?;
+                let record = write_wrapped_remux_block(
+                    &mut sink,
+                    physical_start,
+                    tile_tail,
+                    &block,
+                    byte_order,
+                )?;
+                tile_tail = checked_add_u64(
+                    tile_tail,
+                    wrapped_block_physical_len(block.payload.len())?,
+                    "COG tile tail",
+                )?;
+                records.push(record);
+            }
+            image.blocks = records;
+        }
+
+        let layout = plan_cog_layout_for_variant(
+            base_offset,
+            prefix_len,
+            &images,
+            is_bigtiff,
+        )?;
+        emit_cog(&mut sink, &prefix, &images, &layout, None)?;
+        Ok(sink)
+    }
+
     /// Write a remuxed COG with optional GDAL transparency mask IFDs.
     pub fn remux_layers_to_file<T: NumericSample, P: AsRef<Path>>(
         &self,
@@ -2883,8 +3177,295 @@ impl CogBuilder {
             self.inner.tiff_variant,
             &images,
         )?;
-        emit_cog(&mut sink, &prefix, &images, &layout, &mut spool)?;
+        emit_cog(&mut sink, &prefix, &images, &layout, Some(&mut spool))?;
         Ok(sink)
+    }
+
+    /// Open a COG output file and stream GDAL-wrapped tiles directly into the tile area.
+    pub fn open_streaming_rgb_writer<T: NumericSample, P: AsRef<Path>>(
+        &self,
+        path: P,
+        rgb_layer_count: usize,
+    ) -> Result<StreamingRgbCogWriter> {
+        StreamingRgbCogWriter::create::<T, P>(self, path, rgb_layer_count)
+    }
+}
+
+struct PendingRemuxBlocks {
+    blocks: std::collections::BTreeMap<usize, RemuxCompressedBlock>,
+}
+
+impl PendingRemuxBlocks {
+    fn insert(&mut self, index: usize, block: RemuxCompressedBlock) -> Result<()> {
+        if self.blocks.contains_key(&index) {
+            return Err(Error::Other(format!("duplicate block index {index}")));
+        }
+        self.blocks.insert(index, block);
+        Ok(())
+    }
+
+    fn remove(&mut self, index: usize) -> Result<RemuxCompressedBlock> {
+        self.blocks
+            .remove(&index)
+            .ok_or_else(|| Error::Other(format!("missing pending block index {index}")))
+    }
+}
+
+struct StreamingRgbCogInner {
+    file: Arc<Mutex<File>>,
+    prefix: Vec<u8>,
+    byte_order: ByteOrder,
+    data_start: u64,
+    is_bigtiff: bool,
+    base_offset: u64,
+    images: Mutex<Vec<CogImage>>,
+    tile_tail: Arc<Mutex<u64>>,
+    layer_index: Mutex<usize>,
+    layer_count: usize,
+}
+
+/// Stream encoded RGB COG layers directly into the output tile area (no intermediate spool).
+pub struct StreamingRgbCogWriter {
+    inner: Arc<StreamingRgbCogInner>,
+}
+
+/// Parallel-safe writer for one RGB overview layer in a [`StreamingRgbCogWriter`].
+pub struct StreamingRgbCogLayerWriter {
+    layer_index: usize,
+    tx: Option<mpsc::Sender<Result<usize>>>,
+    pending: Arc<Mutex<PendingRemuxBlocks>>,
+    records: Arc<Mutex<Vec<CogBlockRecord>>>,
+    handle: Option<JoinHandle<Result<()>>>,
+    block_count: usize,
+}
+
+impl StreamingRgbCogWriter {
+    fn create<T: NumericSample, P: AsRef<Path>>(
+        cog: &CogBuilder,
+        path: P,
+        rgb_layer_count: usize,
+    ) -> Result<Self> {
+        let overview_levels = cog.normalized_overview_levels()?;
+        let tile_width = cog.inner.tile_width.unwrap_or(256);
+        let tile_height = cog.inner.tile_height.unwrap_or(256);
+        let images = cog.build_remux_rgb_cog_images::<T>(
+            rgb_layer_count,
+            &overview_levels,
+            tile_width,
+            tile_height,
+        )?;
+        let prefix = gdal_structural_metadata_bytes(cog.inner.planar_configuration);
+        let base_offset = 0u64;
+        let prefix_len = checked_len_u64(prefix.len(), "COG prefix")?;
+        let (is_bigtiff, data_start) =
+            resolve_cog_data_start(base_offset, prefix_len, cog.inner.tiff_variant, &images)?;
+        let file = File::create(path)?;
+        Ok(Self {
+            inner: Arc::new(StreamingRgbCogInner {
+                file: Arc::new(Mutex::new(file)),
+                prefix,
+                byte_order: ByteOrder::LittleEndian,
+                data_start,
+                is_bigtiff,
+                base_offset,
+                images: Mutex::new(images),
+                tile_tail: Arc::new(Mutex::new(0)),
+                layer_index: Mutex::new(0),
+                layer_count: rgb_layer_count,
+            }),
+        })
+    }
+
+    pub fn begin_layer(&self, block_count: usize) -> Result<StreamingRgbCogLayerWriter> {
+        let layer_index = {
+            let mut index = self.inner.layer_index.lock().expect("layer index lock");
+            let current = *index;
+            if current >= self.inner.layer_count {
+                return Err(Error::Other("streaming COG writer layer count exceeded".into()));
+            }
+            *index += 1;
+            current
+        };
+        StreamingRgbCogLayerWriter::start(Arc::clone(&self.inner), layer_index, block_count)
+    }
+
+    pub fn commit_layer(&self, layer: StreamingRgbCogLayerWriter) -> Result<()> {
+        let layer_index = layer.layer_index;
+        let records = layer.finish()?;
+        let mut images = self.inner.images.lock().expect("streaming COG images lock");
+        if layer_index >= images.len() {
+            return Err(Error::Other("streaming COG writer layer index out of range".into()));
+        }
+        images[layer_index].blocks = records;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<()> {
+        let images = {
+            let mut guard = self.inner.images.lock().expect("streaming COG images lock");
+            std::mem::take(&mut *guard)
+        };
+        for image in &images {
+            let expected = image.checked_block_count()?;
+            if image.blocks.len() != expected {
+                return Err(Error::Other(format!(
+                    "streaming COG writer missing blocks: expected {expected}, got {}",
+                    image.blocks.len()
+                )));
+            }
+        }
+        let layout = plan_cog_layout_for_variant(
+            self.inner.base_offset,
+            checked_len_u64(self.inner.prefix.len(), "COG prefix")?,
+            &images,
+            self.inner.is_bigtiff,
+        )?;
+        let mut file = self.inner.file.lock().expect("streaming COG file lock");
+        emit_cog(&mut *file, &self.inner.prefix, &images, &layout, None)?;
+        Ok(())
+    }
+}
+
+impl StreamingRgbCogLayerWriter {
+    fn start(
+        inner: Arc<StreamingRgbCogInner>,
+        layer_index: usize,
+        block_count: usize,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel::<Result<usize>>();
+        let pending = Arc::new(Mutex::new(PendingRemuxBlocks {
+            blocks: std::collections::BTreeMap::new(),
+        }));
+        let records = Arc::new(Mutex::new(Vec::with_capacity(block_count)));
+        let pending_for_thread = Arc::clone(&pending);
+        let records_for_thread = Arc::clone(&records);
+        let inner_for_thread = Arc::clone(&inner);
+        let handle = std::thread::spawn(move || {
+            let mut next = 0usize;
+            let mut file = inner_for_thread.file.lock().expect("streaming COG file lock");
+            let byte_order = inner_for_thread.byte_order;
+            let data_start = inner_for_thread.data_start;
+
+            fn drain_ready(
+                pending: &Arc<Mutex<PendingRemuxBlocks>>,
+                records: &Arc<Mutex<Vec<CogBlockRecord>>>,
+                tile_tail: &Arc<Mutex<u64>>,
+                file: &mut File,
+                data_start: u64,
+                byte_order: ByteOrder,
+                next: &mut usize,
+            ) -> Result<()> {
+                while {
+                    let pending = pending.lock().expect("pending remux blocks lock");
+                    pending.blocks.contains_key(next)
+                } {
+                    let block = {
+                        let mut pending = pending.lock().expect("pending remux blocks lock");
+                        pending.remove(*next)?
+                    };
+                    let mut tail = tile_tail.lock().expect("streaming COG tile tail lock");
+                    let physical_start = checked_add_u64(data_start, *tail, "COG block physical offset")?;
+                    let record = write_wrapped_remux_block(
+                        file,
+                        physical_start,
+                        *tail,
+                        &block,
+                        byte_order,
+                    )?;
+                    if !record.sparse {
+                        *tail = checked_add_u64(
+                            *tail,
+                            wrapped_block_physical_len(block.payload.len())?,
+                            "COG tile tail",
+                        )?;
+                    }
+                    records.lock().expect("streaming COG records lock").push(record);
+                    *next += 1;
+                }
+                Ok(())
+            }
+
+            for msg in rx {
+                let index = msg?;
+                if index >= block_count {
+                    return Err(Error::Other(format!(
+                        "block index {index} out of range (layer has {block_count} blocks)"
+                    )));
+                }
+                drain_ready(
+                    &pending_for_thread,
+                    &records_for_thread,
+                    &inner_for_thread.tile_tail,
+                    &mut file,
+                    data_start,
+                    byte_order,
+                    &mut next,
+                )?;
+            }
+            drain_ready(
+                &pending_for_thread,
+                &records_for_thread,
+                &inner_for_thread.tile_tail,
+                &mut file,
+                data_start,
+                byte_order,
+                &mut next,
+            )?;
+            if next != block_count {
+                return Err(Error::Other(format!(
+                    "streaming COG layer expected {block_count} blocks, got {next}"
+                )));
+            }
+            Ok(())
+        });
+        Ok(Self {
+            layer_index,
+            tx: Some(tx),
+            pending,
+            records,
+            handle: Some(handle),
+            block_count,
+        })
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    pub fn write_block(&self, index: usize, block: RemuxCompressedBlock) -> Result<()> {
+        if index >= self.block_count {
+            return Err(Error::Other(format!(
+                "block index {index} out of range (layer has {} blocks)",
+                self.block_count
+            )));
+        }
+        {
+            let mut pending = self.pending.lock().expect("pending remux blocks lock");
+            pending.insert(index, block)?;
+        }
+        self.tx
+            .as_ref()
+            .expect("streaming COG layer writer closed")
+            .send(Ok(index))
+            .map_err(|_| Error::Other("streaming COG layer writer thread stopped".into()))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<CogBlockRecord>> {
+        self.tx.take();
+        let result = self
+            .handle
+            .take()
+            .expect("streaming COG layer writer thread")
+            .join()
+            .map_err(|_| Error::Other("streaming COG layer writer thread panicked".into()))?;
+        result?;
+        let records = self
+            .records
+            .lock()
+            .expect("streaming COG records lock")
+            .clone();
+        Ok(records)
     }
 }
 

@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use geotiff_reader::GeoTiffFile;
 use geotiff_writer::{remux_compress_tile, RemuxCompressedBlock, RemuxTileEncoding};
-use ndarray::{Array3, Axis};
+use ndarray::Array3;
 use rayon::prelude::*;
 use tiff_core::Predictor;
-use tiff_reader::{Ifd, TiffSample};
+use tiff_reader::TiffSample;
 
 use crate::cog::{tile_jobs, CogOutputOptions, TileJob};
 use crate::input::RasterProfile;
@@ -13,13 +13,12 @@ use crate::remux::layer_ifd;
 pub fn build_chunky_band_permute_layers<T>(
     input: &GeoTiffFile,
     bands: &[usize],
-    profile: &RasterProfile,
+    _profile: &RasterProfile,
     opts: &CogOutputOptions,
 ) -> Result<Vec<Vec<RemuxCompressedBlock>>>
 where
     T: TiffSample + geotiff_writer::NumericSample + Copy + Default + Send + Sync,
 {
-    let _ = profile;
     let base_ifd = input.tiff().ifd(input.base_ifd_index())?;
     let tile_size = base_ifd.tile_width().unwrap_or(opts.blocksize) as usize;
     let layer_count = 1 + input.overview_count();
@@ -31,7 +30,6 @@ where
                 input,
                 layer_index,
                 bands,
-                profile,
                 opts,
                 tile_size,
             )
@@ -43,7 +41,6 @@ fn build_chunky_band_permute_layer<T>(
     input: &GeoTiffFile,
     layer_index: usize,
     bands: &[usize],
-    _profile: &RasterProfile,
     opts: &CogOutputOptions,
     tile_size: usize,
 ) -> Result<Vec<RemuxCompressedBlock>>
@@ -59,8 +56,7 @@ where
         .enumerate()
         .map(|(block_index, job)| {
             let data = read_chunky_tile::<T>(input, layer_index, job)?;
-            let data = select_bands(&data, bands)?;
-            let padded = pad_tile_chunky(&data, job.rows, job.cols, bands.len(), tile_size);
+            let padded = permute_and_pad_tile_chunky(&data, bands, job.rows, job.cols, tile_size)?;
             let block = remux_compress_tile(&padded, block_index, encoding)
                 .map_err(|err| anyhow::anyhow!(err))?;
             Ok((block_index, block))
@@ -94,35 +90,30 @@ where
         .context("expected [rows, cols, bands] tile window")
 }
 
-fn select_bands<T: Copy>(data: &Array3<T>, bands: &[usize]) -> Result<Array3<T>> {
-    let mut slices = Vec::with_capacity(bands.len());
-    for band in bands {
-        let index = band - 1;
-        if index >= data.len_of(Axis(2)) {
-            anyhow::bail!("band {band} is out of range for chunky permute");
-        }
-        slices.push(data.index_axis(Axis(2), index).to_owned());
-    }
-    ndarray::stack(Axis(2), &slices.iter().map(|s| s.view()).collect::<Vec<_>>())
-        .context("failed to stack permuted bands")
-}
-
-fn pad_tile_chunky<T: Copy + Default>(
+/// Single-pass band permute + edge padding into the output tile buffer.
+fn permute_and_pad_tile_chunky<T: Copy + Default>(
     data: &Array3<T>,
+    bands: &[usize],
     rows: usize,
     cols: usize,
-    bands: usize,
     tile_size: usize,
-) -> Vec<T> {
-    let mut out = vec![T::default(); tile_size * tile_size * bands];
+) -> Result<Vec<T>> {
+    let src_bands = data.shape()[2];
+    let out_bands = bands.len();
+    let mut out = vec![T::default(); tile_size * tile_size * out_bands];
     for row in 0..rows {
         for col in 0..cols {
-            for band in 0..bands {
-                out[(row * tile_size + col) * bands + band] = data[[row, col, band]];
+            let dst_base = (row * tile_size + col) * out_bands;
+            for (dst_b, &band) in bands.iter().enumerate() {
+                let src_band = band - 1;
+                if src_band >= src_bands {
+                    bail!("band {band} is out of range for chunky permute");
+                }
+                out[dst_base + dst_b] = data[[row, col, src_band]];
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn tile_encoding(
@@ -140,4 +131,29 @@ fn tile_encoding(
         Some(predictor),
         sample_format,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::arr3;
+
+    #[test]
+    fn permute_and_pad_reorders_bands_in_one_pass() {
+        let data = arr3(&[[[1u8, 2, 3]], [[4u8, 5, 6]]]);
+        let out = permute_and_pad_tile_chunky(&data, &[3, 1], 2, 1, 2).unwrap();
+        assert_eq!(out.len(), 2 * 2 * 2);
+        // row0 col0: bands 3,1 -> 3,1
+        assert_eq!(out[0], 3);
+        assert_eq!(out[1], 1);
+        // row1 col0
+        assert_eq!(out[4], 6);
+        assert_eq!(out[5], 4);
+    }
+
+    #[test]
+    fn permute_rejects_out_of_range_band() {
+        let data = arr3(&[[[1u8, 2]]]);
+        assert!(permute_and_pad_tile_chunky(&data, &[3], 1, 1, 1).is_err());
+    }
 }
