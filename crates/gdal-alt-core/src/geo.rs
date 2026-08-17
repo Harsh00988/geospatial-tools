@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use geotiff_core::GeoTransform;
+use std::path::Path;
 
 /// Parse EPSG code and geotransform from a GML JP2 metadata XML payload.
 pub fn parse_gmljp2(xml: &str) -> Result<(u16, GeoTransform)> {
@@ -87,6 +88,58 @@ fn parse_pair(text: &str) -> Result<(f64, f64)> {
         .with_context(|| format!("missing second coordinate in '{text}'"))?
         .parse::<f64>()?;
     Ok((x, y))
+}
+
+/// Parse a GDAL world file (`.tfw`, `.j2w`, `.wld`, etc.).
+pub fn parse_world_file(contents: &str) -> Result<GeoTransform> {
+    let values: Vec<f64> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(6)
+        .map(|line| {
+            line.parse::<f64>()
+                .with_context(|| format!("invalid world file value '{line}'"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.len() < 6 {
+        bail!("world file requires 6 numeric lines");
+    }
+    Ok(GeoTransform {
+        pixel_width: values[0],
+        skew_x: values[1],
+        origin_x: values[4] - values[0] * 0.5,
+        skew_y: values[2],
+        pixel_height: values[3],
+        origin_y: values[5] - values[3] * 0.5,
+    })
+}
+
+/// Read a GDAL world file adjacent to `path`, if present.
+pub fn read_world_file(path: &Path) -> Result<Option<GeoTransform>> {
+    for ext in ["j2w", "jp2w", "wld", "tfw"] {
+        let world_path = path.with_extension(ext);
+        if world_path.is_file() {
+            let contents = std::fs::read_to_string(&world_path)
+                .with_context(|| format!("failed to read {}", world_path.display()))?;
+            return parse_world_file(&contents).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Read an EPSG code from a sidecar `.prj` file when available.
+pub fn read_prj_epsg(path: &Path) -> Option<u16> {
+    let prj_path = path.with_extension("prj");
+    let contents = std::fs::read_to_string(prj_path).ok()?;
+    let marker = "EPSG\",";
+    let idx = contents.find(marker)?;
+    let rest = &contents[idx + marker.len()..];
+    let digits = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
 }
 
 /// Extract the first `xml ` box payload from a JP2 file, including nested superboxes.
@@ -188,6 +241,16 @@ fn read_u64_be(data: &[u8], offset: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_world_file() {
+        let contents = "10\n0\n0\n-10\n300005\n2600035\n";
+        let transform = parse_world_file(contents).unwrap();
+        assert!((transform.pixel_width - 10.0).abs() < 1e-6);
+        assert!((transform.pixel_height + 10.0).abs() < 1e-6);
+        assert!((transform.origin_x - 300000.0).abs() < 1e-6);
+        assert!((transform.origin_y - 2600040.0).abs() < 1e-6);
+    }
 
     #[test]
     fn parses_sentinel2_gml_sample() {

@@ -6,11 +6,10 @@ use geotiff_core::GeoTransform;
 use tiff_core::Compression;
 use tiff_core::SampleFormat;
 
-use crate::geo;
 use crate::input::{detect_source, InputFormat};
-use crate::jp2::Jp2Header;
+use crate::jp2::source::open_jp2_source;
+use crate::jp2::Jp2Raster;
 use crate::open::open_input;
-use crate::util;
 
 #[derive(Debug, Clone)]
 pub struct RasterInfo {
@@ -188,30 +187,43 @@ fn geotiff_info_source(source: &str, mmap: bool) -> Result<RasterInfo> {
 }
 
 fn jp2_info(path: &Path) -> Result<RasterInfo> {
-    let mmap = util::map_file(path)?;
-    let header = Jp2Header::from_bytes(mmap.as_ref())?;
-    let xml = geo::extract_jp2_xml(mmap.as_ref()).ok();
-    let (epsg, transform, bounds) = if let Some(xml) = xml.as_deref() {
-        match geo::parse_gmljp2(xml) {
-            Ok((epsg, transform)) => {
-                let bounds = transform.bounds(header.width, header.height);
-                (Some(epsg as u32), Some(transform), Some(bounds))
-            }
-            Err(_) => (None, None, None),
+    let (source, input_path) = open_jp2_source(
+        &path.to_string_lossy(),
+        true,
+    )?;
+    let raster = Jp2Raster::open(source.as_ref())?;
+    let data = source.as_ref();
+    let (epsg, transform, bounds) = match crate::jp2::resolve_georef(data, input_path.as_deref()) {
+        Ok(georef) => {
+            let epsg = georef
+                .crs
+                .horizontal
+                .as_ref()
+                .and_then(|h| h.projected_epsg)
+                .map(u32::from);
+            let transform = georef.affine;
+            let bounds = transform.map(|t| t.bounds(raster.width, raster.height));
+            (epsg, transform, bounds)
         }
-    } else {
-        (None, None, None)
+        Err(_) => (None, None, None),
+    };
+    let sample_format = match raster.sample_format {
+        tiff_core::SampleFormat::Int => "Int",
+        tiff_core::SampleFormat::Uint => "UInt",
+        other => {
+            return Err(anyhow::anyhow!("unsupported JP2 sample format: {other:?}"));
+        }
     };
 
     Ok(RasterInfo {
         driver: "JP2OpenJPEG".to_owned(),
         path: path.display().to_string(),
-        width: header.width,
-        height: header.height,
-        bands: header.bands,
-        bits_per_sample: header.bits_per_sample as u16,
-        sample_format: "UInt".to_owned(),
-        photometric: format!("{:?}", header.photometric),
+        width: raster.width,
+        height: raster.height,
+        bands: raster.bands,
+        bits_per_sample: raster.bits_per_sample as u16,
+        sample_format: sample_format.to_owned(),
+        photometric: format!("{:?}", raster.photometric),
         compression: "JPEG2000".to_owned(),
         tiled: true,
         block_x: None,

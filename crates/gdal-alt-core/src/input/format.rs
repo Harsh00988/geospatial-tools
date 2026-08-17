@@ -10,9 +10,19 @@ pub enum InputFormat {
 
 pub fn detect_source(source: &str) -> InputFormat {
     if is_http_source(source) {
-        return InputFormat::GeoTiff;
+        return detect_http_source(source);
     }
     detect(Path::new(source))
+}
+
+fn detect_http_source(source: &str) -> InputFormat {
+    let path = source.split('?').next().unwrap_or(source);
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".jp2") || lower.ends_with(".j2k") || lower.ends_with(".j2c") {
+        InputFormat::Jp2
+    } else {
+        InputFormat::GeoTiff
+    }
 }
 
 pub fn detect(path: &Path) -> InputFormat {

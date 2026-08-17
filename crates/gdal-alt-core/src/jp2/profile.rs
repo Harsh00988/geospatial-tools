@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use jpeg2k::DumpImage;
-use tiff_core::PhotometricInterpretation;
+use tiff_core::{PhotometricInterpretation, SampleFormat};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Jp2Raster {
@@ -8,6 +8,7 @@ pub struct Jp2Raster {
     pub height: u32,
     pub bands: u32,
     pub bits_per_sample: u8,
+    pub sample_format: SampleFormat,
     pub photometric: PhotometricInterpretation,
 }
 
@@ -32,16 +33,20 @@ impl Jp2Raster {
                 bail!("JP2 components must share the same signedness");
             }
         }
-        if signed {
-            bail!("signed JP2 components are not supported yet");
-        }
         if !matches!(bits_per_sample, 8 | 12 | 16) {
-            bail!("JP2 fast path supports 8/12/16-bit unsigned imagery (got {bits_per_sample}-bit)");
+            bail!("JP2 supports 8/12/16-bit imagery (got {bits_per_sample}-bit)");
         }
+
+        let sample_format = if signed {
+            SampleFormat::Int
+        } else {
+            SampleFormat::Uint
+        };
 
         let photometric = match bands {
             1 => PhotometricInterpretation::MinIsBlack,
             3 => PhotometricInterpretation::Rgb,
+            4 => PhotometricInterpretation::Rgb,
             _ => PhotometricInterpretation::MinIsBlack,
         };
 
@@ -50,7 +55,22 @@ impl Jp2Raster {
             height,
             bands,
             bits_per_sample,
+            sample_format,
             photometric,
         })
+    }
+
+    pub fn with_band_subset(&self, bands: &[usize]) -> Result<Self> {
+        if bands.is_empty() {
+            bail!("at least one band must be selected");
+        }
+        for band in bands {
+            if *band == 0 || *band > self.bands as usize {
+                bail!("band {band} is out of range (1..={})", self.bands);
+            }
+        }
+        let mut subset = *self;
+        subset.bands = bands.len() as u32;
+        Ok(subset)
     }
 }

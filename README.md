@@ -13,6 +13,20 @@ This repository is a **Cargo workspace** monorepo. Shared raster logic lives in 
 | [`fastvalidate/`](fastvalidate/) | `fastvalidate` | `rio cogeo validate` | COG layout checks — tiled, overviews, compression, georef |
 | [`fastcrop/`](fastcrop/) | `fastcrop` | `gdal_translate -srcwin / -projwin` | Extract a pixel or geographic window to COG |
 | [`fastband/`](fastband/) | `fastband` | `gdal_translate -b` | Subset or reorder bands into a new COG |
+| [`fasttranslate/`](fasttranslate/) | `fasttranslate` | `gdal_translate` + batch | **All tools in one binary** — subcommands below |
+
+### `fasttranslate` subcommands
+
+| Subcommand | Equivalent | Description |
+|------------|------------|-------------|
+| `cog` (alias `translate`) | `fastcog` | GeoTIFF or JP2 → COG |
+| `info` | `fastinfo` | Metadata only |
+| `validate` | `fastvalidate` | COG layout checks |
+| `crop` | `fastcrop` | Pixel or geographic window → COG |
+| `band` | `fastband` | Band subset/reorder → COG |
+| `batch` | — | Convert every raster in a directory to COG (parallel) |
+
+`fastcrop` and `fastband` accept the same compression and mask flags as `fastcog` (`--jpeg-quality`, `--lerc-max-z-error`, `--lerc-additional-compression`, `--no-mask-from-alpha`, `--black-rgb-transparent`).
 
 ## Requirements
 
@@ -35,6 +49,8 @@ Binaries land in `target/release/`:
 ./target/release/fastcrop input.tif crop.tif --srcwin 0 0 1024 1024
 ./target/release/fastband input.tif rgb.tif -b 1 -b 2 -b 3
 ./target/release/fastcog scene.jp2 output_cog.tif -b 512 -c deflate -j 8
+./target/release/fasttranslate cog scene.jp2 output_cog.tif -c deflate -j 8
+./target/release/fasttranslate batch ./scenes ./cogs --skip-existing -j 4
 ```
 
 Install one tool globally:
@@ -58,8 +74,14 @@ fastcrop big.tif window.tif --srcwin 1000 2000 512 512 -c deflate
 # Crop by geographic bounds (ulx uly lrx lry)
 fastcrop georef.tif subset.tif --projwin 500000 6000000 510000 5990000
 
-# RGB from 4-band (drop alpha)
+# RGB from 4-band (drop alpha, keep alpha as mask IFD by default)
 fastband rgba.tif rgb.tif -b 1 -b 2 -b 3
+
+# Crop with LERC output and no alpha-derived mask
+fastcrop big.tif window.tif --srcwin 1000 2000 512 512 -c lerc --lerc-max-z-error 0.01 --no-mask-from-alpha
+
+# Batch-convert a folder (skip files already in output dir)
+fasttranslate batch ./inputs ./outputs --skip-existing -j 4 -c deflate
 
 # Full COG conversion
 fastcog scene.jp2 output_cog.tif -b 512 -c deflate -j 8 -r nearest
@@ -75,7 +97,8 @@ gdal-alternate/
 ├── fastinfo/
 ├── fastvalidate/
 ├── fastcrop/
-└── fastband/
+├── fastband/
+└── fasttranslate/
 ```
 
 ## Development

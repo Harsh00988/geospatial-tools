@@ -19,9 +19,5 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 gdal-alt-core = { path = "../crates/gdal-alt-core" }
-geotiff-writer = "0.8"
-memmap2 = "0.9"
 rayon = "1.10"
 anyhow = "1"
-jpeg2k = { version = "0.10", default-features = false, features = ["openjpeg-sys", "threads"] }
-tiff-core = "0.8"

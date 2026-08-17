@@ -54,7 +54,7 @@ pub fn associated_alpha_band_index(profile: &RasterProfile) -> Option<usize> {
     Some(color_bands + alpha_offset + 1)
 }
 
-fn black_rgb_candidate(profile: &RasterProfile) -> bool {
+pub(crate) fn black_rgb_candidate(profile: &RasterProfile) -> bool {
     profile.bands == 3
         && profile.photometric == PhotometricInterpretation::Rgb
         && profile.extra_samples.is_empty()

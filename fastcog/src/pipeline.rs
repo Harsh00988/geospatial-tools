@@ -1,10 +1,8 @@
 use crate::config::Args;
-use crate::jp2;
 use anyhow::Result;
 use gdal_alt_core::util;
 use gdal_alt_core::{
-    convert_geotiff, detect_source, print_json, ConvertPath, ConvertRequest, ConvertStats,
-    InputFormat,
+    convert_geotiff, print_json, ConvertPath, ConvertRequest, ConvertStats,
 };
 
 pub fn run(args: &Args) -> Result<()> {
@@ -16,27 +14,19 @@ pub fn run(args: &Args) -> Result<()> {
     let input = args.input.to_string_lossy();
     let mmap = args.mmap || auto_mmap_input(&args.input);
 
-    let result: Result<ConvertPath, anyhow::Error> = match detect_source(&input) {
-        InputFormat::Jp2 => {
-            jp2::convert(args, &pool)?;
-            Ok(ConvertPath::StripEncode)
-        }
-        InputFormat::GeoTiff => {
-            let convert = convert_geotiff(
-                &pool,
-                &ConvertRequest {
-                    input: &input,
-                    output: &args.output,
-                    opts: &opts,
-                    mmap,
-                    show_progress: args.show_progress(),
-                    window: None,
-                    bands: None,
-                },
-            )?;
-            Ok(convert.path)
-        }
-    };
+    let result: Result<ConvertPath, anyhow::Error> = convert_geotiff(
+        &pool,
+        &ConvertRequest {
+            input: &input,
+            output: &args.output,
+            opts: &opts,
+            mmap,
+            show_progress: args.show_progress(),
+            window: None,
+            bands: None,
+        },
+    )
+    .map(|convert| convert.path);
 
     let elapsed = started.elapsed().as_secs_f64();
     match result {
@@ -72,7 +62,7 @@ pub fn run(args: &Args) -> Result<()> {
     }
 }
 
-/// Memory-map large local GeoTIFF inputs to reduce read syscall overhead.
+/// Memory-map large local inputs to reduce read syscall overhead.
 fn auto_mmap_input(path: &std::path::Path) -> bool {
     const THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
     std::fs::metadata(path)

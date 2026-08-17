@@ -5,9 +5,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fastcog::{run as run_cog, Args as CogArgs};
 use gdal_alt_core::{
-    convert_geotiff, format_report, format_text, gather, validate_cog, window_from_projwin,
-    window_from_srcwin, CompressionChoice, ConvertRequest, CogOutputOptions,
-    LercAdditionalCompressionChoice, ResamplingChoice,
+    convert_geotiff, extract_footprint, format_report, format_text, gather, validate_cog,
+    window_from_projwin, window_from_srcwin, CompressionChoice, ConvertRequest, CogOutputOptions,
+    FootprintOptions, LercAdditionalCompressionChoice, ResamplingChoice, ValiditySourceChoice,
 };
 
 #[derive(Parser, Debug)]
@@ -15,7 +15,7 @@ use gdal_alt_core::{
     name = "fasttranslate",
     version,
     about = "Unified GDAL-free raster toolkit",
-    long_about = "Wraps fastcog, fastcrop, fastband, fastinfo, and fastvalidate in one binary."
+    long_about = "Wraps fastcog, fastcrop, fastband, fastfootprint, fastinfo, and fastvalidate in one binary."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,6 +36,28 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         mmap: bool,
+    },
+    /// Extract valid-pixel footprint as GeoJSON (fastfootprint)
+    Footprint {
+        /// Input GeoTIFF path
+        input: PathBuf,
+        /// Write GeoJSON to this file (stdout when omitted)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = FootprintSourceArg::Auto)]
+        source: FootprintSourceArg,
+        #[arg(long, default_value_t = 0.0)]
+        simplify: f64,
+        #[arg(long)]
+        no_mask_from_alpha: bool,
+        #[arg(long)]
+        black_rgb_transparent: bool,
+        #[arg(long, value_name = "COL ROW WIDTH HEIGHT", num_args = 4)]
+        srcwin: Option<Vec<usize>>,
+        #[arg(long)]
+        mmap: bool,
+        #[arg(short = 'j', long, default_value_t = 0)]
+        jobs: usize,
     },
     /// Validate COG layout (fastvalidate)
     Validate {
@@ -58,6 +80,15 @@ enum Command {
         compress: CompressionArg,
         #[arg(long, default_value_t = 6)]
         deflate_level: u32,
+        /// JPEG quality when using JPEG compression (1-100)
+        #[arg(long, default_value_t = 75)]
+        jpeg_quality: u8,
+        /// Maximum per-sample error for LERC compression (0 = lossless)
+        #[arg(long, default_value_t = 0.0)]
+        lerc_max_z_error: f64,
+        /// Additional compression for LERC payloads: none, deflate, or zstd
+        #[arg(long, value_enum, default_value_t = LercAdditionalCompressionArg::None)]
+        lerc_additional_compression: LercAdditionalCompressionArg,
         #[arg(short = 'r', long, value_enum, default_value_t = ResamplingArg::Average)]
         resampling: ResamplingArg,
         #[arg(short = 'o', long, value_delimiter = ' ')]
@@ -70,6 +101,12 @@ enum Command {
         jobs: usize,
         #[arg(short = 'q', long)]
         quiet: bool,
+        /// Do not synthesize a GDAL mask IFD from an associated alpha band
+        #[arg(long)]
+        no_mask_from_alpha: bool,
+        /// Treat RGB(0,0,0) as transparent and emit a mask IFD when none exists
+        #[arg(long)]
+        black_rgb_transparent: bool,
     },
     /// Subset or reorder bands into a new COG (fastband)
     Band {
@@ -83,6 +120,15 @@ enum Command {
         compress: CompressionArg,
         #[arg(long, default_value_t = 6)]
         deflate_level: u32,
+        /// JPEG quality when using JPEG compression (1-100)
+        #[arg(long, default_value_t = 75)]
+        jpeg_quality: u8,
+        /// Maximum per-sample error for LERC compression (0 = lossless)
+        #[arg(long, default_value_t = 0.0)]
+        lerc_max_z_error: f64,
+        /// Additional compression for LERC payloads: none, deflate, or zstd
+        #[arg(long, value_enum, default_value_t = LercAdditionalCompressionArg::None)]
+        lerc_additional_compression: LercAdditionalCompressionArg,
         #[arg(short = 'r', long, value_enum, default_value_t = ResamplingArg::Average)]
         resampling: ResamplingArg,
         #[arg(short = 'o', long, value_delimiter = ' ')]
@@ -95,6 +141,12 @@ enum Command {
         jobs: usize,
         #[arg(short = 'q', long)]
         quiet: bool,
+        /// Do not synthesize a GDAL mask IFD from an associated alpha band
+        #[arg(long)]
+        no_mask_from_alpha: bool,
+        /// Treat RGB(0,0,0) as transparent and emit a mask IFD when none exists
+        #[arg(long)]
+        black_rgb_transparent: bool,
     },
     /// Convert every raster in a directory to COG (parallel jobs)
     Batch {
@@ -128,6 +180,27 @@ enum Command {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum FootprintSourceArg {
+    Auto,
+    Mask,
+    Alpha,
+    Nodata,
+    Full,
+}
+
+impl From<FootprintSourceArg> for ValiditySourceChoice {
+    fn from(value: FootprintSourceArg) -> Self {
+        match value {
+            FootprintSourceArg::Auto => Self::Auto,
+            FootprintSourceArg::Mask => Self::Mask,
+            FootprintSourceArg::Alpha => Self::Alpha,
+            FootprintSourceArg::Nodata => Self::Nodata,
+            FootprintSourceArg::Full => Self::Full,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum CompressionArg {
     None,
     Lzw,
@@ -135,6 +208,13 @@ enum CompressionArg {
     Zstd,
     Jpeg,
     Lerc,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LercAdditionalCompressionArg {
+    None,
+    Deflate,
+    Zstd,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -164,6 +244,59 @@ fn main() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Command::Footprint {
+            input,
+            output,
+            source,
+            simplify,
+            no_mask_from_alpha,
+            black_rgb_transparent,
+            srcwin,
+            mmap,
+            jobs,
+        } => {
+            let input_str = input.to_string_lossy();
+            let started = std::time::Instant::now();
+            let window = if let Some(values) = &srcwin {
+                let [col, row, width, height] = values.as_slice() else {
+                    anyhow::bail!("--srcwin requires four integers");
+                };
+                let (img_width, img_height, _) =
+                    gdal_alt_core::input_dimensions(&input_str, mmap)?;
+                Some(window_from_srcwin(
+                    img_width,
+                    img_height,
+                    *col,
+                    *row,
+                    *width,
+                    *height,
+                )?)
+            } else {
+                None
+            };
+            let opts = FootprintOptions {
+                source: source.into(),
+                mask_from_alpha: !no_mask_from_alpha,
+                black_rgb_transparent,
+                simplify_tolerance: simplify,
+                tile_size: 512,
+            };
+            let result = extract_footprint(&input_str, mmap, window, &opts, jobs)?;
+            if let Some(path) = &output {
+                gdal_alt_core::util::ensure_parent_dir(path)?;
+                std::fs::write(path, &result.geojson)?;
+            } else {
+                print!("{}", result.geojson);
+            }
+            eprintln!(
+                "fasttranslate footprint: {} ring(s) from {} validity / {} georef in {:.3}s",
+                result.ring_count,
+                result.validity_source,
+                result.georef_source,
+                started.elapsed().as_secs_f64()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Validate { input, mmap } => {
             let started = std::time::Instant::now();
             let report = validate_cog(&input, mmap)?;
@@ -186,12 +319,17 @@ fn main() -> Result<ExitCode> {
             blocksize,
             compress,
             deflate_level,
+            jpeg_quality,
+            lerc_max_z_error,
+            lerc_additional_compression,
             resampling,
             overviews,
             no_overviews,
             mmap,
             jobs,
             quiet,
+            no_mask_from_alpha,
+            black_rgb_transparent,
         } => {
             if srcwin.is_some() && projwin.is_some() {
                 anyhow::bail!("use only one of --srcwin or --projwin");
@@ -204,26 +342,31 @@ fn main() -> Result<ExitCode> {
                 blocksize,
                 compress,
                 deflate_level,
+                jpeg_quality,
+                lerc_max_z_error,
+                lerc_additional_compression,
                 resampling,
                 overviews,
                 no_overviews,
+                no_mask_from_alpha,
+                black_rgb_transparent,
             );
             opts.validate()?;
 
             let input_str = input.to_string_lossy();
-            let handle = gdal_alt_core::open::open_input(&input_str, mmap)?;
-            let geotiff = handle.as_file();
+            let (img_width, img_height, _) = gdal_alt_core::input_dimensions(&input_str, mmap)?;
             let window = if let Some(values) = &srcwin {
                 let [col, row, width, height] = values.as_slice() else {
                     anyhow::bail!("--srcwin requires four integers");
                 };
-                window_from_srcwin(geotiff.width(), geotiff.height(), *col, *row, *width, *height)?
+                window_from_srcwin(img_width, img_height, *col, *row, *width, *height)?
             } else {
                 let values = projwin.as_ref().unwrap();
                 let [ulx, uly, lrx, lry] = values.as_slice() else {
                     anyhow::bail!("--projwin requires four coordinates");
                 };
-                window_from_projwin(geotiff, *ulx, *uly, *lrx, *lry)?
+                let handle = gdal_alt_core::open::open_input(&input_str, mmap)?;
+                window_from_projwin(handle.as_file(), *ulx, *uly, *lrx, *lry)?
             };
 
             let pool = gdal_alt_core::util::thread_pool(jobs)?;
@@ -256,20 +399,30 @@ fn main() -> Result<ExitCode> {
             blocksize,
             compress,
             deflate_level,
+            jpeg_quality,
+            lerc_max_z_error,
+            lerc_additional_compression,
             resampling,
             overviews,
             no_overviews,
             mmap,
             jobs,
             quiet,
+            no_mask_from_alpha,
+            black_rgb_transparent,
         } => {
             let opts = simple_cog_options(
                 blocksize,
                 compress,
                 deflate_level,
+                jpeg_quality,
+                lerc_max_z_error,
+                lerc_additional_compression,
                 resampling,
                 overviews,
                 no_overviews,
+                no_mask_from_alpha,
+                black_rgb_transparent,
             );
             opts.validate()?;
 
@@ -334,9 +487,14 @@ fn simple_cog_options(
     blocksize: u32,
     compress: CompressionArg,
     deflate_level: u32,
+    jpeg_quality: u8,
+    lerc_max_z_error: f64,
+    lerc_additional_compression: LercAdditionalCompressionArg,
     resampling: ResamplingArg,
     overviews: Option<Vec<u32>>,
     no_overviews: bool,
+    no_mask_from_alpha: bool,
+    black_rgb_transparent: bool,
 ) -> CogOutputOptions {
     CogOutputOptions {
         blocksize,
@@ -349,9 +507,13 @@ fn simple_cog_options(
             CompressionArg::Lerc => CompressionChoice::Lerc,
         },
         deflate_level,
-        jpeg_quality: 75,
-        lerc_max_z_error: 0.0,
-        lerc_additional_compression: LercAdditionalCompressionChoice::None,
+        jpeg_quality,
+        lerc_max_z_error,
+        lerc_additional_compression: match lerc_additional_compression {
+            LercAdditionalCompressionArg::None => LercAdditionalCompressionChoice::None,
+            LercAdditionalCompressionArg::Deflate => LercAdditionalCompressionChoice::Deflate,
+            LercAdditionalCompressionArg::Zstd => LercAdditionalCompressionChoice::Zstd,
+        },
         resampling: match resampling {
             ResamplingArg::Nearest => ResamplingChoice::Nearest,
             ResamplingArg::Average => ResamplingChoice::Average,
@@ -361,8 +523,8 @@ fn simple_cog_options(
         },
         overview_levels: overviews,
         no_overviews,
-        mask_from_alpha: true,
-        black_rgb_transparent: false,
+        mask_from_alpha: !no_mask_from_alpha,
+        black_rgb_transparent,
     }
 }
 
@@ -508,6 +670,16 @@ fn cog_output_name(input: &Path) -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from("output"));
     name.push(".tif");
     name
+}
+
+impl From<LercAdditionalCompressionArg> for fastcog::config::LercAdditionalCompressionArg {
+    fn from(value: LercAdditionalCompressionArg) -> Self {
+        match value {
+            LercAdditionalCompressionArg::None => Self::None,
+            LercAdditionalCompressionArg::Deflate => Self::Deflate,
+            LercAdditionalCompressionArg::Zstd => Self::Zstd,
+        }
+    }
 }
 
 impl From<CompressionArg> for fastcog::config::CompressionArg {

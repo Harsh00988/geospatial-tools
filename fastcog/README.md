@@ -63,7 +63,7 @@ fastcog input.tif output_cog.tif
 
 **GeoTIFF** — any size/dtype (8–64 bit int/float), multi-band, chunky/planar, full georef + nodata preservation, auto BigTIFF.
 
-**JP2** — 3-band RGB 8-bit (e.g. Sentinel-2), GML georeferencing.
+**JP2** — 8/12/16-bit unsigned or signed, 1–4+ bands, GML or world-file georef, local or HTTP input, crop/band subset, full overview pyramid (software downsample beyond OpenJPEG 16× reduce).
 
 ## Performance
 

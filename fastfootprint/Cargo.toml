@@ -1,0 +1,16 @@
+[package]
+name = "fastfootprint"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Extract exact valid-pixel footprint as GeoJSON (gdal footprint alternative)"
+readme = "README.md"
+
+[[bin]]
+name = "fastfootprint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+gdal-alt-core = { path = "../crates/gdal-alt-core" }

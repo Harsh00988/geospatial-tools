@@ -7,7 +7,7 @@ use tiff_reader::TiffSample;
 
 use crate::cog::CogOutputOptions;
 use crate::crop::WriteWindow;
-use crate::input::RasterProfile;
+use crate::input::{detect_source, InputFormat, RasterProfile};
 use crate::open::{open_input, GeoTiffHandle};
 use crate::path::{log_convert_path, ConvertPath};
 use crate::util::ensure_parent_dir;
@@ -29,6 +29,17 @@ pub struct ConvertResult {
 pub fn convert_geotiff(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -> Result<ConvertResult> {
     request.opts.validate()?;
     ensure_parent_dir(request.output)?;
+    match detect_source(request.input) {
+        InputFormat::Jp2 => {
+            let path = crate::jp2::convert(pool, request)?;
+            log_convert_path(path, request.show_progress);
+            Ok(ConvertResult { path })
+        }
+        InputFormat::GeoTiff => convert_geotiff_file(pool, request),
+    }
+}
+
+fn convert_geotiff_file(pool: &rayon::ThreadPool, request: &ConvertRequest<'_>) -> Result<ConvertResult> {
     let handle = open_input(request.input, request.mmap)?;
     let input = handle.as_file();
     let mut profile = RasterProfile::from_geotiff(input)?;

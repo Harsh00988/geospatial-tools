@@ -1,6 +1,7 @@
 pub mod cog;
 pub mod crop;
 pub mod encode;
+pub mod footprint;
 pub mod geo;
 pub mod info;
 pub mod input;
@@ -25,8 +26,13 @@ pub use cog::{
     TransparencySource,
 };
 pub use crop::{shift_transform, window_from_projwin, window_from_srcwin, WriteWindow};
+pub use footprint::{
+    extract_footprint, extract_footprint_geotiff, FootprintOptions, FootprintResult,
+    ResolvedValiditySource, ValiditySourceChoice,
+};
 pub use info::{format_text, gather, gather_path, RasterInfo};
-pub use input::{detect, detect_source, InputFormat, RasterProfile, projected_georef};
+pub use input::{detect, detect_source, input_dimensions, InputFormat, RasterProfile, projected_georef};
+pub use jp2::Jp2Raster;
 pub use open::{open_geotiff, open_input, GeoTiffHandle, is_http_source};
 pub use path::{log_convert_path, ConvertPath};
 pub use stats::{print_json, ConvertStats};
