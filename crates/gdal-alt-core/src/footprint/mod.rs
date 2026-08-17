@@ -1,8 +1,10 @@
 mod crs;
 mod georef;
 mod mask;
+mod mask_jp2;
 mod options;
 mod rpc;
+mod tps;
 mod trace;
 
 use std::path::Path;
@@ -16,11 +18,15 @@ use rayon::ThreadPool;
 use serde_json::json;
 
 use crate::crop::WriteWindow;
-use crate::input::RasterProfile;
+use crate::input::{detect_source, InputFormat, RasterProfile};
+use crate::jp2::{open_jp2_source, resolve_georef, Jp2Raster};
 use crate::open::open_geotiff;
 use crate::util::thread_pool;
 
-use georef::{resolve_footprint_georef, FootprintGeoref, FootprintGeorefKind, FootprintGeorefState};
+use georef::{
+    resolve_footprint_georef, resolve_footprint_georef_profile, FootprintGeoref,
+    FootprintGeorefKind, FootprintGeorefState,
+};
 
 pub use options::{FootprintOptions, ResolvedValiditySource, ValiditySourceChoice};
 
@@ -39,10 +45,66 @@ pub fn extract_footprint(
     opts: &FootprintOptions,
     jobs: usize,
 ) -> Result<FootprintResult> {
-    let input = open_geotiff(Path::new(path), mmap)?;
-    let profile = RasterProfile::from_geotiff(&input)?;
     let pool = thread_pool(jobs)?;
-    extract_footprint_geotiff(&input, &profile, window, opts, &pool)
+    match detect_source(path) {
+        InputFormat::GeoTiff => {
+            let input = open_geotiff(Path::new(path), mmap)?;
+            let profile = RasterProfile::from_geotiff(&input)?;
+            extract_footprint_geotiff(&input, &profile, window, opts, &pool)
+        }
+        InputFormat::Jp2 => extract_footprint_jp2(path, mmap, window, opts, &pool),
+    }
+}
+
+pub fn extract_footprint_jp2(
+    path: &str,
+    mmap: bool,
+    window: Option<WriteWindow>,
+    opts: &FootprintOptions,
+    pool: &ThreadPool,
+) -> Result<FootprintResult> {
+    let (source, local_path) = open_jp2_source(path, mmap)?;
+    let data = source.as_ref();
+    let raster = Jp2Raster::open(data)?;
+    let georef = resolve_georef(data, local_path.as_deref())?;
+    let mut profile = RasterProfile::from_jp2(&raster, georef);
+    if let Some(win) = window {
+        profile = profile.with_window(&win);
+    }
+
+    let source_kind = options::resolve_validity_source_jp2(&profile, opts)?;
+    let nodata = match source_kind {
+        ResolvedValiditySource::Nodata => Some(
+            options::nodata_value_for_profile(&profile)
+                .ok_or_else(|| anyhow::anyhow!("no usable nodata value for footprint"))?,
+        ),
+        _ => options::nodata_value_for_profile(&profile),
+    };
+
+    let georef_state = resolve_footprint_georef_state_profile(&profile, None)?;
+    let (width, height) = output_dimensions(&profile, window.as_ref());
+
+    let validity = mask_jp2::build_validity_mask_jp2(
+        data,
+        &raster,
+        &profile,
+        source_kind,
+        window.as_ref(),
+        nodata,
+        opts.zero_threshold,
+        opts.tile_size,
+        pool,
+    )?;
+
+    finish_footprint(
+        validity,
+        width,
+        height,
+        &georef_state,
+        source_kind,
+        profile.epsg(),
+        opts.simplify_tolerance,
+    )
 }
 
 pub fn extract_footprint_geotiff(
@@ -63,6 +125,7 @@ pub fn extract_footprint_geotiff(
 
     let georef = resolve_footprint_georef_state(input, profile, window.as_ref())?;
     let (width, height) = output_dimensions(profile, window.as_ref());
+    let native_epsg = profile.epsg().or_else(|| input.epsg());
 
     let validity = mask::build_validity_mask(
         input,
@@ -70,10 +133,31 @@ pub fn extract_footprint_geotiff(
         source,
         window.as_ref(),
         nodata,
+        opts.zero_threshold,
         opts.tile_size,
         pool,
     )?;
 
+    finish_footprint(
+        validity,
+        width,
+        height,
+        &georef,
+        source,
+        native_epsg,
+        opts.simplify_tolerance,
+    )
+}
+
+fn finish_footprint(
+    validity: mask::ValidityMask,
+    width: usize,
+    height: usize,
+    georef: &FootprintGeorefState,
+    source: ResolvedValiditySource,
+    native_epsg: Option<u32>,
+    simplify_tolerance: f64,
+) -> Result<FootprintResult> {
     let pixel_rings = if validity.all_valid() {
         vec![full_extent_pixel_ring(width, height)]
     } else if validity.none_valid() {
@@ -84,11 +168,11 @@ pub fn extract_footprint_geotiff(
 
     let geo_rings = pixel_rings
         .into_iter()
-        .map(|ring| pixel_ring_to_geo(&ring, &georef, opts.simplify_tolerance))
+        .map(|ring| pixel_ring_to_geo(&ring, georef, simplify_tolerance))
         .collect::<Result<Vec<_>>>()?;
 
     let ring_count = geo_rings.len();
-    let geojson = rings_to_geojson(geo_rings, source, georef.kind, input.epsg())?;
+    let geojson = rings_to_geojson(geo_rings, source, georef.kind, native_epsg)?;
 
     Ok(FootprintResult {
         geojson,
@@ -112,6 +196,34 @@ fn resolve_footprint_georef_state(
 ) -> Result<FootprintGeorefState> {
     let mut state = {
         let (georef, kind) = resolve_footprint_georef(input, profile)?;
+        FootprintGeorefState {
+            georef,
+            kind,
+            col_off: 0.0,
+            row_off: 0.0,
+        }
+    };
+    if let Some(win) = window {
+        if let FootprintGeoref::Affine(transform) = &state.georef {
+            state.georef = FootprintGeoref::Affine(crate::crop::shift_transform(
+                transform,
+                win.col_off,
+                win.row_off,
+            ));
+        } else {
+            state.col_off = win.col_off as f64;
+            state.row_off = win.row_off as f64;
+        }
+    }
+    Ok(state)
+}
+
+fn resolve_footprint_georef_state_profile(
+    profile: &RasterProfile,
+    window: Option<&WriteWindow>,
+) -> Result<FootprintGeorefState> {
+    let mut state = {
+        let (georef, kind) = resolve_footprint_georef_profile(profile);
         FootprintGeorefState {
             georef,
             kind,

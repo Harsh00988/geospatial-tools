@@ -44,7 +44,7 @@ impl ValidityMask {
         self.valid_count() == 0
     }
 
-    fn write_tile(&mut self, job: &TileJob, tile: &[u8], cols: usize) {
+    pub(crate) fn write_tile(&mut self, job: &TileJob, tile: &[u8], cols: usize) {
         for row in 0..job.rows {
             let dst_row = job.row_off + row;
             let src_start = row * cols;
@@ -61,6 +61,7 @@ pub fn build_validity_mask(
     source: ResolvedValiditySource,
     window: Option<&WriteWindow>,
     nodata: Option<NodataValue>,
+    zero_threshold: f64,
     tile_size: u32,
     pool: &ThreadPool,
 ) -> Result<ValidityMask> {
@@ -74,7 +75,15 @@ pub fn build_validity_mask(
     let tiles = pool.install(|| {
         jobs.par_iter()
             .map(|job| {
-                let tile = read_validity_tile(input, profile, source, window, nodata, job)?;
+                let tile = read_validity_tile(
+                    input,
+                    profile,
+                    source,
+                    window,
+                    nodata,
+                    zero_threshold,
+                    job,
+                )?;
                 Ok((job.clone(), tile))
             })
             .collect::<Result<Vec<_>>>()
@@ -99,6 +108,7 @@ fn read_validity_tile(
     source: ResolvedValiditySource,
     window: Option<&WriteWindow>,
     nodata: Option<NodataValue>,
+    zero_threshold: f64,
     job: &TileJob,
 ) -> Result<Vec<u8>> {
     let (src_col, src_row) = source_origin(window, job);
@@ -113,6 +123,9 @@ fn read_validity_tile(
         ResolvedValiditySource::Nodata => {
             let nodata = nodata.ok_or_else(|| anyhow::anyhow!("missing nodata value"))?;
             read_nodata_tile(input, profile, nodata, src_row, src_col, job)
+        }
+        ResolvedValiditySource::NonZero => {
+            read_nonzero_tile(input, profile, zero_threshold, src_row, src_col, job)
         }
         ResolvedValiditySource::Full => Ok(vec![1; job.rows * job.cols]),
     }
@@ -190,8 +203,16 @@ fn alpha_to_validity(array: &Array2<u8>) -> Vec<u8> {
     array.iter().map(|&value| u8::from(value > 0)).collect()
 }
 
+pub(crate) fn alpha_u8_to_validity(array: &Array2<u8>) -> Vec<u8> {
+    alpha_to_validity(array)
+}
+
 fn alpha_u16_to_validity(array: &Array2<u16>) -> Vec<u8> {
     array.iter().map(|&value| u8::from(value > 0)).collect()
+}
+
+pub(crate) fn alpha_u16_to_validity_pub(array: &Array2<u16>) -> Vec<u8> {
+    alpha_u16_to_validity(array)
 }
 
 fn read_black_rgb_tile(
@@ -233,6 +254,10 @@ fn black_rgb_u8_to_validity(array: &Array3<u8>) -> Vec<u8> {
     out
 }
 
+pub(crate) fn black_rgb_u8_to_validity_pub(array: &Array3<u8>) -> Vec<u8> {
+    black_rgb_u8_to_validity(array)
+}
+
 fn black_rgb_u16_to_validity(array: &Array3<u16>) -> Vec<u8> {
     let rows = array.shape()[0];
     let cols = array.shape()[1];
@@ -246,6 +271,10 @@ fn black_rgb_u16_to_validity(array: &Array3<u16>) -> Vec<u8> {
         }
     }
     out
+}
+
+pub(crate) fn black_rgb_u16_to_validity_pub(array: &Array3<u16>) -> Vec<u8> {
+    black_rgb_u16_to_validity(array)
 }
 
 fn read_nodata_tile(
@@ -339,4 +368,87 @@ fn read_nodata_tile(
         }
         _ => Ok(vec![1; job.rows * job.cols]),
     }
+}
+
+fn read_nonzero_tile(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    zero_threshold: f64,
+    src_row: usize,
+    src_col: usize,
+    job: &TileJob,
+) -> Result<Vec<u8>> {
+    match (profile.sample.sample_format, profile.sample.bits_per_sample) {
+        (tiff_core::SampleFormat::Uint, 8) => {
+            let data = input.read_band_window::<u8>(0, src_row, src_col, job.rows, job.cols)?;
+            let array = data
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|err| anyhow::anyhow!("nonzero window must be 2D: {err}"))?;
+            Ok(nonzero_u8_to_validity(&array, zero_threshold))
+        }
+        (tiff_core::SampleFormat::Uint, 16) => {
+            let data = input.read_band_window::<u16>(0, src_row, src_col, job.rows, job.cols)?;
+            let array = data
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|err| anyhow::anyhow!("nonzero window must be 2D: {err}"))?;
+            Ok(nonzero_u16_to_validity(&array, zero_threshold))
+        }
+        (tiff_core::SampleFormat::Int, 16) => {
+            let data = input.read_band_window::<i16>(0, src_row, src_col, job.rows, job.cols)?;
+            let array = data
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|err| anyhow::anyhow!("nonzero window must be 2D: {err}"))?;
+            Ok(nonzero_i16_to_validity(&array, zero_threshold))
+        }
+        (tiff_core::SampleFormat::Float, 32) => {
+            let data = input.read_band_window::<f32>(0, src_row, src_col, job.rows, job.cols)?;
+            let array = data
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|err| anyhow::anyhow!("nonzero window must be 2D: {err}"))?;
+            Ok(nonzero_f32_to_validity(&array, zero_threshold))
+        }
+        (tiff_core::SampleFormat::Float, 64) => {
+            let data = input.read_band_window::<f64>(0, src_row, src_col, job.rows, job.cols)?;
+            let array = data
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|err| anyhow::anyhow!("nonzero window must be 2D: {err}"))?;
+            Ok(nonzero_f64_to_validity(&array, zero_threshold))
+        }
+        _ => Ok(vec![1; job.rows * job.cols]),
+    }
+}
+
+pub(crate) fn nonzero_u8_to_validity(array: &Array2<u8>, threshold: f64) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| u8::from(value as f64 > threshold))
+        .collect()
+}
+
+pub(crate) fn nonzero_u16_to_validity(array: &Array2<u16>, threshold: f64) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| u8::from(value as f64 > threshold))
+        .collect()
+}
+
+pub(crate) fn nonzero_i16_to_validity(array: &Array2<i16>, threshold: f64) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| u8::from(value as f64 > threshold))
+        .collect()
+}
+
+pub(crate) fn nonzero_f32_to_validity(array: &Array2<f32>, threshold: f64) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| u8::from(value as f64 > threshold))
+        .collect()
+}
+
+pub(crate) fn nonzero_f64_to_validity(array: &Array2<f64>, threshold: f64) -> Vec<u8> {
+    array
+        .iter()
+        .map(|&value| u8::from(value > threshold))
+        .collect()
 }

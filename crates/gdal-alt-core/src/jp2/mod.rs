@@ -3,6 +3,8 @@ mod profile;
 pub(crate) mod source;
 mod stream;
 
+pub(crate) use decode::{Jp2Sample, Region};
+
 use std::path::Path;
 
 use anyhow::{bail, Result};

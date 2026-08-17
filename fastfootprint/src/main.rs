@@ -13,14 +13,14 @@ use gdal_alt_core::{
     about = "Extract the exact valid-pixel footprint as GeoJSON"
 )]
 struct Args {
-    /// Input GeoTIFF path
+    /// Input GeoTIFF or JP2 path
     pub input: PathBuf,
 
     /// Write GeoJSON to this file (stdout when omitted)
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
-    /// Validity source: auto, mask, alpha, nodata, or full
+    /// Validity source: auto, mask, alpha, nodata, nonzero, or full
     #[arg(long, value_enum, default_value_t = SourceArg::Auto)]
     pub source: SourceArg,
 
@@ -35,6 +35,14 @@ struct Args {
     /// Treat RGB(0,0,0) as invalid in auto mode
     #[arg(long)]
     pub black_rgb_transparent: bool,
+
+    /// Do not treat single-band zero pixels as invalid in auto mode
+    #[arg(long)]
+    pub no_nonzero_in_auto: bool,
+
+    /// Absolute threshold for nonzero validity (default: exact zero)
+    #[arg(long, default_value_t = 0.0)]
+    pub zero_threshold: f64,
 
     /// Pixel window: COL ROW WIDTH HEIGHT
     #[arg(long, value_name = "COL ROW WIDTH HEIGHT", num_args = 4)]
@@ -55,6 +63,7 @@ enum SourceArg {
     Mask,
     Alpha,
     Nodata,
+    NonZero,
     Full,
 }
 
@@ -65,6 +74,7 @@ impl From<SourceArg> for ValiditySourceChoice {
             SourceArg::Mask => Self::Mask,
             SourceArg::Alpha => Self::Alpha,
             SourceArg::Nodata => Self::Nodata,
+            SourceArg::NonZero => Self::NonZero,
             SourceArg::Full => Self::Full,
         }
     }
@@ -98,6 +108,8 @@ fn main() -> Result<()> {
         black_rgb_transparent: args.black_rgb_transparent,
         simplify_tolerance: args.simplify,
         tile_size: 512,
+        nonzero_in_auto: !args.no_nonzero_in_auto,
+        zero_threshold: args.zero_threshold,
     };
 
     let result = extract_footprint(&input, args.mmap, window, &opts, args.jobs)?;

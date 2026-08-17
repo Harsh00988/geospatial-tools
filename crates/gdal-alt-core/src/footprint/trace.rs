@@ -139,11 +139,17 @@ fn chain_segments(mut segments: Vec<((f64, f64), (f64, f64))>) -> Vec<Vec<(f64, 
         let mut prev: Option<(i64, i64)> = None;
 
         loop {
-            let neighbors = adjacency.get_mut(&current).expect("segment endpoint missing");
-            let next_idx = neighbors
+            let neighbors = match adjacency.get_mut(&current) {
+                Some(neighbors) if !neighbors.is_empty() => neighbors,
+                _ => break,
+            };
+            let next_idx = match neighbors
                 .iter()
                 .position(|point| prev.map(|p| quantize(*point) != p).unwrap_or(true))
-                .expect("open contour chain");
+            {
+                Some(idx) => idx,
+                None => break,
+            };
             let next_point = neighbors.swap_remove(next_idx);
             let next_key = quantize(next_point);
             if next_key == start_key {

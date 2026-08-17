@@ -39,7 +39,7 @@ enum Command {
     },
     /// Extract valid-pixel footprint as GeoJSON (fastfootprint)
     Footprint {
-        /// Input GeoTIFF path
+        /// Input GeoTIFF or JP2 path
         input: PathBuf,
         /// Write GeoJSON to this file (stdout when omitted)
         #[arg(short = 'o', long)]
@@ -52,6 +52,10 @@ enum Command {
         no_mask_from_alpha: bool,
         #[arg(long)]
         black_rgb_transparent: bool,
+        #[arg(long)]
+        no_nonzero_in_auto: bool,
+        #[arg(long, default_value_t = 0.0)]
+        zero_threshold: f64,
         #[arg(long, value_name = "COL ROW WIDTH HEIGHT", num_args = 4)]
         srcwin: Option<Vec<usize>>,
         #[arg(long)]
@@ -185,6 +189,7 @@ enum FootprintSourceArg {
     Mask,
     Alpha,
     Nodata,
+    NonZero,
     Full,
 }
 
@@ -195,6 +200,7 @@ impl From<FootprintSourceArg> for ValiditySourceChoice {
             FootprintSourceArg::Mask => Self::Mask,
             FootprintSourceArg::Alpha => Self::Alpha,
             FootprintSourceArg::Nodata => Self::Nodata,
+            FootprintSourceArg::NonZero => Self::NonZero,
             FootprintSourceArg::Full => Self::Full,
         }
     }
@@ -251,6 +257,8 @@ fn main() -> Result<ExitCode> {
             simplify,
             no_mask_from_alpha,
             black_rgb_transparent,
+            no_nonzero_in_auto,
+            zero_threshold,
             srcwin,
             mmap,
             jobs,
@@ -280,6 +288,8 @@ fn main() -> Result<ExitCode> {
                 black_rgb_transparent,
                 simplify_tolerance: simplify,
                 tile_size: 512,
+                nonzero_in_auto: !no_nonzero_in_auto,
+                zero_threshold,
             };
             let result = extract_footprint(&input_str, mmap, window, &opts, jobs)?;
             if let Some(path) = &output {

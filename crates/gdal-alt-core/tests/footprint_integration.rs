@@ -85,13 +85,9 @@ fn footprint_gcp_georef_when_available() {
     let result = extract_footprint(&path.to_string_lossy(), false, None, &FootprintOptions::default(), 0)
         .expect("extract footprint");
 
-    assert_eq!(result.validity_source, "full");
-    assert_eq!(result.ring_count, 1);
-    assert!(
-        result.georef_source == "rpc" || result.georef_source == "gcp_grid",
-        "expected rpc or gcp_grid georef, got {}",
-        result.georef_source
-    );
+    assert_eq!(result.validity_source, "nonzero");
+    assert!(result.ring_count >= 1);
+    assert_eq!(result.georef_source, "rpc");
 }
 
 #[test]
@@ -128,4 +124,27 @@ fn footprint_external_masked_fixture_when_available() {
     );
     assert!(result.ring_count >= 1);
     assert!(result.geojson.contains("FeatureCollection"));
+}
+
+#[test]
+fn footprint_jp2_when_available() {
+    let candidates = [
+        "/home/harsh.goyal@SUHORA.LOCAL/Downloads/test_data/S2C_MSIL2A_20260810T055631_N0512_R091_T42QUL_20260810T090514.jp2",
+        "test_data/sentinel2_sample.jp2",
+    ];
+    let Some(path) = candidates
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+    else {
+        eprintln!("skipping JP2 footprint test: fixture not found");
+        return;
+    };
+
+    let result = extract_footprint(&path.to_string_lossy(), false, None, &FootprintOptions::default(), 0)
+        .expect("extract jp2 footprint");
+
+    assert!(result.ring_count >= 1);
+    assert!(result.geojson.contains("EPSG:4326") || result.geojson.contains("4326"));
+    assert!(result.georef_source == "affine" || result.georef_source == "pixel");
 }

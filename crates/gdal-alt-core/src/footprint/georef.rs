@@ -5,11 +5,13 @@ use geotiff_reader::GeoTiffFile;
 use crate::input::RasterProfile;
 
 use super::rpc::{read_rpc_model, RpcModel};
+use super::tps::GcpTps;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FootprintGeorefKind {
     Affine,
     GcpGrid,
+    GcpTps,
     GcpAffine,
     Rpc,
     Pixel,
@@ -20,6 +22,7 @@ impl FootprintGeorefKind {
         match self {
             Self::Affine => "affine",
             Self::GcpGrid => "gcp_grid",
+            Self::GcpTps => "gcp_tps",
             Self::GcpAffine => "gcp_affine",
             Self::Rpc => "rpc",
             Self::Pixel => "pixel",
@@ -46,6 +49,7 @@ impl FootprintGeorefState {
 pub enum FootprintGeoref {
     Affine(GeoTransform),
     GcpGrid(GcpGrid),
+    GcpTps(GcpTps),
     Rpc(RpcModel),
     Pixel,
 }
@@ -55,6 +59,7 @@ impl FootprintGeoref {
         match self {
             Self::Affine(transform) => transform.pixel_to_geo(col, row),
             Self::GcpGrid(grid) => grid.pixel_to_geo(col, row),
+            Self::GcpTps(model) => model.pixel_to_geo(col, row),
             Self::Rpc(model) => model.pixel_to_geo(col, row),
             Self::Pixel => (col, row),
         }
@@ -175,6 +180,9 @@ pub fn resolve_footprint_georef(
     if let Some(grid) = GcpGrid::try_from_tiepoints(&tiepoints) {
         return Ok((FootprintGeoref::GcpGrid(grid), FootprintGeorefKind::GcpGrid));
     }
+    if let Some(model) = GcpTps::try_from_tiepoints(&tiepoints) {
+        return Ok((FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps));
+    }
     if let Some(transform) = fit_affine_from_tiepoints(&tiepoints) {
         return Ok((
             FootprintGeoref::Affine(transform),
@@ -183,6 +191,34 @@ pub fn resolve_footprint_georef(
     }
 
     Ok((FootprintGeoref::Pixel, FootprintGeorefKind::Pixel))
+}
+
+pub fn resolve_footprint_georef_profile(profile: &RasterProfile) -> (FootprintGeoref, FootprintGeorefKind) {
+    if let Some(affine) = profile.georef.affine {
+        return (FootprintGeoref::Affine(affine), FootprintGeorefKind::Affine);
+    }
+    if let Some(matrix) = profile.georef.transformation_matrix {
+        return (
+            FootprintGeoref::Affine(GeoTransform::from_transformation_matrix(&matrix)),
+            FootprintGeorefKind::Affine,
+        );
+    }
+    if let Some(tiepoints) = profile.georef.model_tiepoints.as_ref() {
+        if let Some(grid) = GcpGrid::try_from_tiepoints(tiepoints) {
+            return (FootprintGeoref::GcpGrid(grid), FootprintGeorefKind::GcpGrid);
+        }
+        if let Some(model) = GcpTps::try_from_tiepoints(tiepoints) {
+            return (FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps);
+        }
+        if let Some(transform) = fit_affine_from_tiepoints(tiepoints) {
+            return (
+                FootprintGeoref::Affine(transform),
+                FootprintGeorefKind::GcpAffine,
+            );
+        }
+    }
+
+    (FootprintGeoref::Pixel, FootprintGeorefKind::Pixel)
 }
 
 fn collect_tiepoints(input: &GeoTiffFile, profile: &RasterProfile) -> Vec<f64> {

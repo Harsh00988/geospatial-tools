@@ -11,6 +11,7 @@ use tiff_core::{
 use tiff_reader::Ifd;
 
 use crate::cog::{apply_compression, tiff_variant, CogOutputOptions};
+use crate::jp2::Jp2Raster;
 
 #[derive(Debug, Clone)]
 pub struct SampleLayout {
@@ -85,6 +86,39 @@ impl RasterProfile {
                 model_tiepoints: read_model_tiepoints(input),
             },
         })
+    }
+
+    pub fn from_jp2(raster: &Jp2Raster, georef: GeorefProfile) -> Self {
+        let mut extra_samples = Vec::new();
+        if raster.bands == 4 && raster.photometric == PhotometricInterpretation::Rgb {
+            extra_samples.push(ExtraSample::AssociatedAlpha);
+        }
+        Self {
+            width: raster.width,
+            height: raster.height,
+            bands: raster.bands,
+            sample: SampleLayout {
+                bits_per_sample: raster.bits_per_sample as u16,
+                sample_format: raster.sample_format,
+            },
+            photometric: raster.photometric,
+            planar_configuration: PlanarConfiguration::Chunky,
+            extra_samples,
+            color_map: None,
+            ink_set: None,
+            ycbcr_subsampling: None,
+            ycbcr_positioning: None,
+            nodata: None,
+            georef,
+        }
+    }
+
+    pub fn epsg(&self) -> Option<u32> {
+        self.georef
+            .crs
+            .projected_epsg()
+            .or_else(|| self.georef.crs.geographic_epsg())
+            .map(u32::from)
     }
 
     pub fn base_builder(&self, opts: &CogOutputOptions) -> GeoTiffBuilder {

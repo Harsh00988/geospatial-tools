@@ -4,6 +4,7 @@ use geotiff_reader::GeoTiffFile;
 use crate::cog::mask::discover_dataset_masks;
 use crate::cog::semantics::{associated_alpha_band_index, black_rgb_candidate, parse_nodata};
 use crate::input::RasterProfile;
+use tiff_core::PhotometricInterpretation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValiditySourceChoice {
@@ -11,6 +12,7 @@ pub enum ValiditySourceChoice {
     Mask,
     Alpha,
     Nodata,
+    NonZero,
     Full,
 }
 
@@ -25,6 +27,10 @@ pub struct FootprintOptions {
     pub simplify_tolerance: f64,
     /// Tile size for parallel validity reads.
     pub tile_size: u32,
+    /// In auto mode, treat single-band zero/near-zero pixels as invalid (SAR padding).
+    pub nonzero_in_auto: bool,
+    /// Absolute threshold for nonzero validity (`0.0` = exact zero only).
+    pub zero_threshold: f64,
 }
 
 impl Default for FootprintOptions {
@@ -35,6 +41,8 @@ impl Default for FootprintOptions {
             black_rgb_transparent: false,
             simplify_tolerance: 0.0,
             tile_size: 512,
+            nonzero_in_auto: true,
+            zero_threshold: 0.0,
         }
     }
 }
@@ -44,6 +52,7 @@ pub enum ResolvedValiditySource {
     DatasetMask,
     AssociatedAlpha,
     Nodata,
+    NonZero,
     BlackRgb,
     Full,
 }
@@ -54,6 +63,7 @@ impl ResolvedValiditySource {
             Self::DatasetMask => "mask",
             Self::AssociatedAlpha => "alpha",
             Self::Nodata => "nodata",
+            Self::NonZero => "nonzero",
             Self::BlackRgb => "black_rgb",
             Self::Full => "full",
         }
@@ -84,6 +94,7 @@ pub fn resolve_validity_source(
             }
             Ok(ResolvedValiditySource::Nodata)
         }
+        ValiditySourceChoice::NonZero => Ok(ResolvedValiditySource::NonZero),
         ValiditySourceChoice::Full => Ok(ResolvedValiditySource::Full),
         ValiditySourceChoice::Auto => Ok(resolve_auto(input, profile, opts)),
     }
@@ -103,10 +114,59 @@ fn resolve_auto(
     if profile.nodata.is_some() && nodata_value_for_profile(profile).is_some() {
         return ResolvedValiditySource::Nodata;
     }
+    if opts.nonzero_in_auto && nonzero_candidate(profile) {
+        return ResolvedValiditySource::NonZero;
+    }
     if opts.black_rgb_transparent && black_rgb_candidate(profile) {
         return ResolvedValiditySource::BlackRgb;
     }
     ResolvedValiditySource::Full
+}
+
+pub fn resolve_validity_source_jp2(
+    profile: &RasterProfile,
+    opts: &FootprintOptions,
+) -> Result<ResolvedValiditySource> {
+    match opts.source {
+        ValiditySourceChoice::Mask => {
+            bail!("--source mask is not supported for JP2 inputs");
+        }
+        ValiditySourceChoice::Alpha => {
+            if associated_alpha_band_index(profile).is_none() {
+                bail!("--source alpha requested but no associated alpha band was found");
+            }
+            Ok(ResolvedValiditySource::AssociatedAlpha)
+        }
+        ValiditySourceChoice::Nodata => {
+            if nodata_value_for_profile(profile).is_none() {
+                bail!("--source nodata requested but the raster has no usable nodata value");
+            }
+            Ok(ResolvedValiditySource::Nodata)
+        }
+        ValiditySourceChoice::NonZero => Ok(ResolvedValiditySource::NonZero),
+        ValiditySourceChoice::Full => Ok(ResolvedValiditySource::Full),
+        ValiditySourceChoice::Auto => Ok(resolve_auto_jp2(profile, opts)),
+    }
+}
+
+fn resolve_auto_jp2(profile: &RasterProfile, opts: &FootprintOptions) -> ResolvedValiditySource {
+    if opts.mask_from_alpha && associated_alpha_band_index(profile).is_some() {
+        return ResolvedValiditySource::AssociatedAlpha;
+    }
+    if profile.nodata.is_some() && nodata_value_for_profile(profile).is_some() {
+        return ResolvedValiditySource::Nodata;
+    }
+    if opts.nonzero_in_auto && nonzero_candidate(profile) {
+        return ResolvedValiditySource::NonZero;
+    }
+    if opts.black_rgb_transparent && black_rgb_candidate(profile) {
+        return ResolvedValiditySource::BlackRgb;
+    }
+    ResolvedValiditySource::Full
+}
+
+pub fn nonzero_candidate(profile: &RasterProfile) -> bool {
+    profile.bands == 1 && profile.photometric == PhotometricInterpretation::MinIsBlack
 }
 
 pub fn nodata_value_for_profile(profile: &RasterProfile) -> Option<NodataValue> {
