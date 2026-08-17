@@ -43,6 +43,26 @@ fn web_mercator_to_wgs84(x: f64, y: f64) -> (f64, f64) {
     (lon, lat)
 }
 
+/// Reproject WGS84 lon/lat to a target EPSG (inverse of [`to_wgs84`]).
+pub fn from_wgs84(epsg: u32, lon: f64, lat: f64) -> (f64, f64) {
+    if epsg == 4326 {
+        return (lon, lat);
+    }
+    if epsg == 3857 {
+        const R: f64 = 6_378_137.0;
+        let x = lon.to_radians() * R;
+        let y = ((lat.to_radians() / 2.0 + std::f64::consts::FRAC_PI_4).tan()).ln() * R;
+        return (x, y);
+    }
+    match transform_epsg(4326, epsg, lon, lat) {
+        Ok(point) => point,
+        Err(err) => {
+            eprintln!("footprint: EPSG:4326 -> EPSG:{epsg} failed ({err}); passing coordinates through");
+            (lon, lat)
+        }
+    }
+}
+
 fn transform_epsg(from: u32, to: u32, x: f64, y: f64) -> Result<(f64, f64), proj::ProjError> {
     init_proj_env();
     thread_local! {

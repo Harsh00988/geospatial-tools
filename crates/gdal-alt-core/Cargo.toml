@@ -24,3 +24,7 @@ geo = { version = "0.29", default-features = false, features = ["serde"] }
 geojson = "0.24"
 tempfile = "3"
 proj = { version = "0.31", features = ["bundled_proj"] }
+
+[[bin]]
+name = "footprint-fixture-gen"
+path = "src/bin/footprint_fixture_gen.rs"

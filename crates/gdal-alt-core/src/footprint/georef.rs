@@ -4,8 +4,35 @@ use geotiff_reader::GeoTiffFile;
 
 use crate::input::RasterProfile;
 
-use super::rpc::{read_rpc_model, RpcModel};
+use super::rpc::{read_rpc_model, RpcGeoref};
 use super::tps::GcpTps;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FootprintGeorefChoice {
+    #[default]
+    Auto,
+    Affine,
+    Rpc,
+    GcpTps,
+    GcpGrid,
+    GcpAffine,
+    Pixel,
+}
+
+impl FootprintGeorefChoice {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "affine" => Some(Self::Affine),
+            "rpc" => Some(Self::Rpc),
+            "tps" | "gcp-tps" | "gcp_tps" => Some(Self::GcpTps),
+            "grid" | "gcp-grid" | "gcp_grid" => Some(Self::GcpGrid),
+            "gcp-affine" | "gcp_affine" => Some(Self::GcpAffine),
+            "pixel" => Some(Self::Pixel),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FootprintGeorefKind {
@@ -50,7 +77,7 @@ pub enum FootprintGeoref {
     Affine(GeoTransform),
     GcpGrid(GcpGrid),
     GcpTps(GcpTps),
-    Rpc(RpcModel),
+    Rpc(RpcGeoref),
     Pixel,
 }
 
@@ -139,10 +166,24 @@ impl GcpGrid {
     }
 }
 
+#[allow(dead_code)]
 pub fn resolve_footprint_georef(
     input: &GeoTiffFile,
     profile: &RasterProfile,
 ) -> Result<(FootprintGeoref, FootprintGeorefKind)> {
+    resolve_footprint_georef_with_choice(input, profile, FootprintGeorefChoice::Auto, usize::MAX)
+}
+
+pub fn resolve_footprint_georef_with_choice(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    choice: FootprintGeorefChoice,
+    tps_max_points: usize,
+) -> Result<(FootprintGeoref, FootprintGeorefKind)> {
+    if choice != FootprintGeorefChoice::Auto {
+        return resolve_forced_georef(input, profile, choice, tps_max_points);
+    }
+
     if let Some(transform) = input.transform() {
         return Ok((FootprintGeoref::Affine(*transform), FootprintGeorefKind::Affine));
     }
@@ -173,15 +214,15 @@ pub fn resolve_footprint_georef(
         }
     }
     if let Some(model) = read_rpc_model(input) {
-        return Ok((FootprintGeoref::Rpc(model), FootprintGeorefKind::Rpc));
+        return Ok((FootprintGeoref::Rpc(RpcGeoref::from_model(model)), FootprintGeorefKind::Rpc));
     }
 
     let tiepoints = collect_tiepoints(input, profile);
+    if let Some(model) = GcpTps::try_from_tiepoints(&tiepoints, tps_max_points) {
+        return Ok((FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps));
+    }
     if let Some(grid) = GcpGrid::try_from_tiepoints(&tiepoints) {
         return Ok((FootprintGeoref::GcpGrid(grid), FootprintGeorefKind::GcpGrid));
-    }
-    if let Some(model) = GcpTps::try_from_tiepoints(&tiepoints) {
-        return Ok((FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps));
     }
     if let Some(transform) = fit_affine_from_tiepoints(&tiepoints) {
         return Ok((
@@ -193,7 +234,78 @@ pub fn resolve_footprint_georef(
     Ok((FootprintGeoref::Pixel, FootprintGeorefKind::Pixel))
 }
 
-pub fn resolve_footprint_georef_profile(profile: &RasterProfile) -> (FootprintGeoref, FootprintGeorefKind) {
+fn resolve_forced_georef(
+    input: &GeoTiffFile,
+    profile: &RasterProfile,
+    choice: FootprintGeorefChoice,
+    tps_max_points: usize,
+) -> Result<(FootprintGeoref, FootprintGeorefKind)> {
+    let tiepoints = collect_tiepoints(input, profile);
+    match choice {
+        FootprintGeorefChoice::Auto => unreachable!(),
+        FootprintGeorefChoice::Affine => {
+            if let Some(transform) = input.transform() {
+                return Ok((FootprintGeoref::Affine(*transform), FootprintGeorefKind::Affine));
+            }
+            if let Some(affine) = profile.georef.affine {
+                return Ok((FootprintGeoref::Affine(affine), FootprintGeorefKind::Affine));
+            }
+            if let Some(matrix) = profile.georef.transformation_matrix {
+                return Ok((
+                    FootprintGeoref::Affine(GeoTransform::from_transformation_matrix(&matrix)),
+                    FootprintGeorefKind::Affine,
+                ));
+            }
+            if let Some(matrix) = input.metadata().transformation.as_ref() {
+                return Ok((
+                    FootprintGeoref::Affine(GeoTransform::from_transformation_matrix(matrix)),
+                    FootprintGeorefKind::Affine,
+                ));
+            }
+            if let Some(scale) = input.metadata().pixel_scale {
+                if let Some(tiepoint) = input.metadata().tiepoints.first() {
+                    let raster_type = profile.georef.crs.raster_type_enum();
+                    return Ok((
+                        FootprintGeoref::Affine(GeoTransform::from_tiepoint_and_scale_with_raster_type(
+                            tiepoint, &scale, raster_type,
+                        )),
+                        FootprintGeorefKind::Affine,
+                    ));
+                }
+            }
+            if let Some(transform) = fit_affine_from_tiepoints(&tiepoints) {
+                return Ok((FootprintGeoref::Affine(transform), FootprintGeorefKind::GcpAffine));
+            }
+            anyhow::bail!("--georef affine requested but no affine transform is available");
+        }
+        FootprintGeorefChoice::Rpc => {
+            let model = read_rpc_model(input)
+                .ok_or_else(|| anyhow::anyhow!("--georef rpc requested but no RPC model was found"))?;
+            Ok((FootprintGeoref::Rpc(RpcGeoref::from_model(model)), FootprintGeorefKind::Rpc))
+        }
+        FootprintGeorefChoice::GcpTps => {
+            let model = GcpTps::try_from_tiepoints(&tiepoints, tps_max_points)
+                .ok_or_else(|| anyhow::anyhow!("--georef tps requested but GCP tiepoints are insufficient"))?;
+            Ok((FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps))
+        }
+        FootprintGeorefChoice::GcpGrid => {
+            let grid = GcpGrid::try_from_tiepoints(&tiepoints)
+                .ok_or_else(|| anyhow::anyhow!("--georef gcp-grid requested but GCPs do not form a regular grid"))?;
+            Ok((FootprintGeoref::GcpGrid(grid), FootprintGeorefKind::GcpGrid))
+        }
+        FootprintGeorefChoice::GcpAffine => {
+            let transform = fit_affine_from_tiepoints(&tiepoints)
+                .ok_or_else(|| anyhow::anyhow!("--georef gcp-affine requested but GCP fit failed"))?;
+            Ok((FootprintGeoref::Affine(transform), FootprintGeorefKind::GcpAffine))
+        }
+        FootprintGeorefChoice::Pixel => Ok((FootprintGeoref::Pixel, FootprintGeorefKind::Pixel)),
+    }
+}
+
+pub fn resolve_footprint_georef_profile(
+    profile: &RasterProfile,
+    tps_max_points: usize,
+) -> (FootprintGeoref, FootprintGeorefKind) {
     if let Some(affine) = profile.georef.affine {
         return (FootprintGeoref::Affine(affine), FootprintGeorefKind::Affine);
     }
@@ -204,11 +316,11 @@ pub fn resolve_footprint_georef_profile(profile: &RasterProfile) -> (FootprintGe
         );
     }
     if let Some(tiepoints) = profile.georef.model_tiepoints.as_ref() {
+        if let Some(model) = GcpTps::try_from_tiepoints(tiepoints, tps_max_points) {
+            return (FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps);
+        }
         if let Some(grid) = GcpGrid::try_from_tiepoints(tiepoints) {
             return (FootprintGeoref::GcpGrid(grid), FootprintGeorefKind::GcpGrid);
-        }
-        if let Some(model) = GcpTps::try_from_tiepoints(tiepoints) {
-            return (FootprintGeoref::GcpTps(model), FootprintGeorefKind::GcpTps);
         }
         if let Some(transform) = fit_affine_from_tiepoints(tiepoints) {
             return (

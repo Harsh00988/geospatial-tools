@@ -120,7 +120,8 @@ fn read_validity_tile_jp2(
         ResolvedValiditySource::NonZero => {
             decode_nonzero_tile(&image, raster, zero_threshold, job.rows, job.cols)
         }
-        ResolvedValiditySource::DatasetMask | ResolvedValiditySource::Full => {
+        ResolvedValiditySource::DatasetMask => decode_jp2_bitmask_tile(&image, raster, job.rows, job.cols),
+        ResolvedValiditySource::Full => {
             Ok(vec![1; job.rows * job.cols])
         }
     }
@@ -205,6 +206,17 @@ fn decode_nodata_tile(
         }
         _ => Ok(vec![1; rows * cols]),
     }
+}
+
+fn decode_jp2_bitmask_tile(
+    image: &jpeg2k::Image,
+    raster: &Jp2Raster,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>> {
+    let planes = u8::planes(image, raster.sample_format, raster.bits_per_sample, Some(&[1]))?;
+    let array = plane_to_array2(&planes.planes[0], rows, cols)?;
+    Ok(array.iter().map(|&value| u8::from(value > 0)).collect())
 }
 
 fn decode_nonzero_tile(

@@ -7,7 +7,8 @@ use fastcog::{run as run_cog, Args as CogArgs};
 use gdal_alt_core::{
     convert_geotiff, extract_footprint, format_report, format_text, gather, validate_cog,
     window_from_projwin, window_from_srcwin, CompressionChoice, ConvertRequest, CogOutputOptions,
-    FootprintOptions, LercAdditionalCompressionChoice, ResamplingChoice, ValiditySourceChoice,
+    FootprintGeorefChoice, FootprintOptions, FootprintOutputFormat, LercAdditionalCompressionChoice,
+    ResamplingChoice, ValiditySourceChoice,
 };
 
 #[derive(Parser, Debug)]
@@ -41,13 +42,29 @@ enum Command {
     Footprint {
         /// Input GeoTIFF or JP2 path
         input: PathBuf,
-        /// Write GeoJSON to this file (stdout when omitted)
+        /// Write output to this file (stdout when omitted)
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = FootprintSourceArg::Auto)]
         source: FootprintSourceArg,
+        #[arg(long, value_enum, default_value_t = FootprintFormatArg::GeoJson)]
+        format: FootprintFormatArg,
+        #[arg(long)]
+        georef: Option<String>,
+        #[arg(long, default_value_t = 400)]
+        tps_max_points: usize,
         #[arg(long, default_value_t = 0.0)]
         simplify: f64,
+        #[arg(long, default_value_t = 0.0)]
+        simplify_degrees: f64,
+        #[arg(long)]
+        outer_only: bool,
+        #[arg(long)]
+        all_rings: bool,
+        #[arg(long)]
+        rpc_height: Option<f64>,
+        #[arg(long)]
+        dem: Option<PathBuf>,
         #[arg(long)]
         no_mask_from_alpha: bool,
         #[arg(long)]
@@ -62,6 +79,47 @@ enum Command {
         mmap: bool,
         #[arg(short = 'j', long, default_value_t = 0)]
         jobs: usize,
+    },
+    /// Extract footprints for every raster in a directory
+    FootprintBatch {
+        input_dir: PathBuf,
+        output_dir: PathBuf,
+        #[arg(long, value_enum, default_value_t = FootprintSourceArg::Auto)]
+        source: FootprintSourceArg,
+        #[arg(long, value_enum, default_value_t = FootprintFormatArg::GeoJson)]
+        format: FootprintFormatArg,
+        #[arg(long)]
+        georef: Option<String>,
+        #[arg(long, default_value_t = 400)]
+        tps_max_points: usize,
+        #[arg(long, default_value_t = 0.0)]
+        simplify: f64,
+        #[arg(long, default_value_t = 0.0)]
+        simplify_degrees: f64,
+        #[arg(long)]
+        outer_only: bool,
+        #[arg(long)]
+        all_rings: bool,
+        #[arg(long)]
+        rpc_height: Option<f64>,
+        #[arg(long)]
+        dem: Option<PathBuf>,
+        #[arg(long)]
+        no_mask_from_alpha: bool,
+        #[arg(long)]
+        black_rgb_transparent: bool,
+        #[arg(long)]
+        no_nonzero_in_auto: bool,
+        #[arg(long, default_value_t = 0.0)]
+        zero_threshold: f64,
+        #[arg(long)]
+        mmap: bool,
+        #[arg(short = 'j', long, default_value_t = 0)]
+        jobs: usize,
+        #[arg(long, default_value_t = 0)]
+        parallel: usize,
+        #[arg(long)]
+        skip_existing: bool,
     },
     /// Validate COG layout (fastvalidate)
     Validate {
@@ -193,6 +251,23 @@ enum FootprintSourceArg {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FootprintFormatArg {
+    GeoJson,
+    Wkt,
+    Flat,
+}
+
+impl From<FootprintFormatArg> for FootprintOutputFormat {
+    fn from(value: FootprintFormatArg) -> Self {
+        match value {
+            FootprintFormatArg::GeoJson => Self::GeoJson,
+            FootprintFormatArg::Wkt => Self::Wkt,
+            FootprintFormatArg::Flat => Self::WktFlat,
+        }
+    }
+}
+
 impl From<FootprintSourceArg> for ValiditySourceChoice {
     fn from(value: FootprintSourceArg) -> Self {
         match value {
@@ -254,7 +329,15 @@ fn main() -> Result<ExitCode> {
             input,
             output,
             source,
+            format,
+            georef,
+            tps_max_points,
             simplify,
+            simplify_degrees,
+            outer_only,
+            all_rings,
+            rpc_height,
+            dem,
             no_mask_from_alpha,
             black_rgb_transparent,
             no_nonzero_in_auto,
@@ -282,29 +365,85 @@ fn main() -> Result<ExitCode> {
             } else {
                 None
             };
-            let opts = FootprintOptions {
-                source: source.into(),
-                mask_from_alpha: !no_mask_from_alpha,
+            let opts = build_footprint_options(
+                source,
+                format,
+                georef,
+                tps_max_points,
+                simplify,
+                simplify_degrees,
+                outer_only,
+                all_rings,
+                rpc_height,
+                dem,
+                no_mask_from_alpha,
                 black_rgb_transparent,
-                simplify_tolerance: simplify,
-                tile_size: 512,
-                nonzero_in_auto: !no_nonzero_in_auto,
+                no_nonzero_in_auto,
                 zero_threshold,
-            };
+            )?;
             let result = extract_footprint(&input_str, mmap, window, &opts, jobs)?;
             if let Some(path) = &output {
                 gdal_alt_core::util::ensure_parent_dir(path)?;
-                std::fs::write(path, &result.geojson)?;
+                std::fs::write(path, &result.body)?;
             } else {
-                print!("{}", result.geojson);
+                print!("{}", result.body);
             }
             eprintln!(
-                "fasttranslate footprint: {} ring(s) from {} validity / {} georef in {:.3}s",
+                "fasttranslate footprint: {} ring(s), {} vertices, {} validity, {} georef in {:.3}s",
                 result.ring_count,
+                result.vertex_count,
                 result.validity_source,
                 result.georef_source,
                 started.elapsed().as_secs_f64()
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::FootprintBatch {
+            input_dir,
+            output_dir,
+            source,
+            format,
+            georef,
+            tps_max_points,
+            simplify,
+            simplify_degrees,
+            outer_only,
+            all_rings,
+            rpc_height,
+            dem,
+            no_mask_from_alpha,
+            black_rgb_transparent,
+            no_nonzero_in_auto,
+            zero_threshold,
+            mmap,
+            jobs,
+            parallel,
+            skip_existing,
+        } => {
+            run_footprint_batch(
+                &input_dir,
+                &output_dir,
+                build_footprint_options(
+                    source,
+                    format,
+                    georef,
+                    tps_max_points,
+                    simplify,
+                    simplify_degrees,
+                    outer_only,
+                    all_rings,
+                    rpc_height,
+                    dem,
+                    no_mask_from_alpha,
+                    black_rgb_transparent,
+                    no_nonzero_in_auto,
+                    zero_threshold,
+                )?,
+                mmap,
+                jobs,
+                parallel,
+                skip_existing,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Validate { input, mmap } => {
@@ -536,6 +675,170 @@ fn simple_cog_options(
         mask_from_alpha: !no_mask_from_alpha,
         black_rgb_transparent,
     }
+}
+
+fn build_footprint_options(
+    source: FootprintSourceArg,
+    format: FootprintFormatArg,
+    georef: Option<String>,
+    tps_max_points: usize,
+    simplify: f64,
+    simplify_degrees: f64,
+    outer_only: bool,
+    all_rings: bool,
+    rpc_height: Option<f64>,
+    dem: Option<PathBuf>,
+    no_mask_from_alpha: bool,
+    black_rgb_transparent: bool,
+    no_nonzero_in_auto: bool,
+    zero_threshold: f64,
+) -> Result<FootprintOptions> {
+    let georef = match georef.as_deref() {
+        Some(value) => Some(
+            FootprintGeorefChoice::parse(value)
+                .ok_or_else(|| anyhow::anyhow!("unknown --georef value: {value}"))?,
+        ),
+        None => None,
+    };
+    Ok(FootprintOptions {
+        source: source.into(),
+        mask_from_alpha: !no_mask_from_alpha,
+        black_rgb_transparent,
+        simplify_tolerance: simplify,
+        tile_size: 512,
+        nonzero_in_auto: !no_nonzero_in_auto,
+        zero_threshold,
+        outer_only,
+        all_rings,
+        simplify_degrees,
+        rpc_height,
+        dem_path: dem.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        georef,
+        tps_max_points,
+        output_format: format.into(),
+    })
+}
+
+fn run_footprint_batch(
+    input_dir: &Path,
+    output_dir: &Path,
+    opts: FootprintOptions,
+    mmap: bool,
+    jobs: usize,
+    parallel: usize,
+    skip_existing: bool,
+) -> Result<()> {
+    if !input_dir.is_dir() {
+        bail!("input is not a directory: {}", input_dir.display());
+    }
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let mut inputs = Vec::new();
+    for entry in std::fs::read_dir(input_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && is_raster_input(&path) {
+            inputs.push(path);
+        }
+    }
+    inputs.sort();
+    if inputs.is_empty() {
+        bail!("no raster files found in {}", input_dir.display());
+    }
+
+    let workers = if parallel == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        parallel.max(1)
+    };
+
+    let started = std::time::Instant::now();
+    let mut ok = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    rayon::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut in_flight = 0usize;
+
+        for input in inputs {
+            let output = output_dir.join(footprint_output_name(&input, &opts.output_format));
+            if skip_existing && output.exists() {
+                skipped += 1;
+                eprintln!("skip existing {}", output.display());
+                continue;
+            }
+
+            while in_flight >= workers {
+                match rx.recv() {
+                    Ok(true) => ok += 1,
+                    Ok(false) => failed += 1,
+                    Err(_) => break,
+                }
+                in_flight -= 1;
+            }
+
+            let tx = tx.clone();
+            let opts = opts.clone();
+            let input_str = input.to_string_lossy().into_owned();
+            scope.spawn(move |_| {
+                let success = (|| {
+                    let result = extract_footprint(&input_str, mmap, None, &opts, jobs)?;
+                    gdal_alt_core::util::ensure_parent_dir(&output)?;
+                    std::fs::write(&output, &result.body)?;
+                    eprintln!(
+                        "ok {} -> {} ({} rings, {} vertices)",
+                        input_str,
+                        output.display(),
+                        result.ring_count,
+                        result.vertex_count
+                    );
+                    Ok::<(), anyhow::Error>(())
+                })()
+                .is_ok();
+                if !success {
+                    eprintln!("fail {input_str}");
+                }
+                let _ = tx.send(success);
+            });
+            in_flight += 1;
+        }
+
+        for _ in 0..in_flight {
+            match rx.recv() {
+                Ok(true) => ok += 1,
+                Ok(false) => failed += 1,
+                Err(_) => break,
+            }
+        }
+    });
+
+    eprintln!(
+        "fasttranslate footprint-batch: {ok} ok, {skipped} skipped, {failed} failed in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+    if failed > 0 {
+        bail!("{failed} file(s) failed");
+    }
+    Ok(())
+}
+
+fn footprint_output_name(input: &Path, format: &FootprintOutputFormat) -> std::ffi::OsString {
+    let mut name = input
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("output"));
+    let ext = match format {
+        FootprintOutputFormat::GeoJson => "geojson",
+        FootprintOutputFormat::Wkt => "wkt",
+        FootprintOutputFormat::WktFlat => "wkt.txt",
+    };
+    name.push(".");
+    name.push(ext);
+    name
 }
 
 fn run_batch(

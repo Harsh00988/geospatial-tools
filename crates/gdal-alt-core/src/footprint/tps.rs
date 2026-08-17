@@ -14,7 +14,8 @@ struct TpsSurface {
 }
 
 impl GcpTps {
-    pub fn try_from_tiepoints(tiepoints: &[f64]) -> Option<Self> {
+    pub fn try_from_tiepoints(tiepoints: &[f64], max_points: usize) -> Option<Self> {
+        let tiepoints = subsample_tiepoints(tiepoints, max_points);
         if tiepoints.len() < 24 || tiepoints.len() % 6 != 0 {
             return None;
         }
@@ -48,6 +49,20 @@ impl GcpTps {
             self.lat_model.eval(col, row, &self.px, &self.py),
         )
     }
+}
+
+fn subsample_tiepoints(tiepoints: &[f64], max_points: usize) -> Vec<f64> {
+    let point_count = tiepoints.len() / 6;
+    if point_count <= max_points || max_points == 0 {
+        return tiepoints.to_vec();
+    }
+    let stride = (point_count as f64 / max_points as f64).ceil() as usize;
+    tiepoints
+        .chunks(6)
+        .enumerate()
+        .filter_map(|(index, chunk)| (index % stride == 0).then(|| chunk.to_vec()))
+        .flatten()
+        .collect()
 }
 
 impl TpsSurface {
@@ -158,7 +173,7 @@ mod tests {
             5.0, 0.0, 0.0, 5.0, 10.0, 0.0, //
             0.0, 5.0, 0.0, 0.0, 5.0, 0.0, //
         ];
-        let tps = GcpTps::try_from_tiepoints(&tiepoints).expect("tps");
+        let tps = GcpTps::try_from_tiepoints(&tiepoints, usize::MAX).expect("tps");
         let (lon, lat) = tps.pixel_to_geo(0.0, 0.0);
         assert!((lon - 0.0).abs() < 1e-6, "lon={lon}");
         assert!((lat - 10.0).abs() < 1e-6, "lat={lat}");
@@ -176,7 +191,7 @@ mod tests {
             500.0, 800.0, 0.0, 66.15, 25.15, 0.0, //
             300.0, 500.0, 0.0, 66.125, 25.175, 0.0, //
         ];
-        let tps = GcpTps::try_from_tiepoints(&tiepoints).expect("tps");
+        let tps = GcpTps::try_from_tiepoints(&tiepoints, usize::MAX).expect("tps");
         let (lon, lat) = tps.pixel_to_geo(300.0, 500.0);
         assert!((lon - 66.125).abs() < 1e-6);
         assert!((lat - 25.175).abs() < 1e-6);

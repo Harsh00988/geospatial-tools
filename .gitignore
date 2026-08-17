@@ -11,13 +11,15 @@
 .DS_Store
 Thumbs.db
 
-# Local geospatial test data
+# Local geospatial test data (allow committed fixtures under test_data/)
 *.tif
 *.tiff
 *.jp2
 *.j2k
 *.j2c
 *.img
+!test_data/**
+!test_data/**/*
 
 # Env / secrets
 .env

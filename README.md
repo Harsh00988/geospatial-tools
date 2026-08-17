@@ -13,6 +13,7 @@ This repository is a **Cargo workspace** monorepo. Shared raster logic lives in 
 | [`fastvalidate/`](fastvalidate/) | `fastvalidate` | `rio cogeo validate` | COG layout checks — tiled, overviews, compression, georef |
 | [`fastcrop/`](fastcrop/) | `fastcrop` | `gdal_translate -srcwin / -projwin` | Extract a pixel or geographic window to COG |
 | [`fastband/`](fastband/) | `fastband` | `gdal_translate -b` | Subset or reorder bands into a new COG |
+| [`fastfootprint/`](fastfootprint/) | `fastfootprint` | `gdal footprint` | Exact valid-pixel footprint as GeoJSON (GeoTIFF + JP2) |
 | [`fasttranslate/`](fasttranslate/) | `fasttranslate` | `gdal_translate` + batch | **All tools in one binary** — subcommands below |
 
 ### `fasttranslate` subcommands
@@ -24,6 +25,8 @@ This repository is a **Cargo workspace** monorepo. Shared raster logic lives in 
 | `validate` | `fastvalidate` | COG layout checks |
 | `crop` | `fastcrop` | Pixel or geographic window → COG |
 | `band` | `fastband` | Band subset/reorder → COG |
+| `footprint` | `fastfootprint` | Valid-pixel footprint → GeoJSON/WKT |
+| `footprint-batch` | — | Footprints for every raster in a directory |
 | `batch` | — | Convert every raster in a directory to COG (parallel) |
 
 `fastcrop` and `fastband` accept the same compression and mask flags as `fastcog` (`--jpeg-quality`, `--lerc-max-z-error`, `--lerc-additional-compression`, `--no-mask-from-alpha`, `--black-rgb-transparent`).
@@ -83,6 +86,16 @@ fastcrop big.tif window.tif --srcwin 1000 2000 512 512 -c lerc --lerc-max-z-erro
 # Batch-convert a folder (skip files already in output dir)
 fasttranslate batch ./inputs ./outputs --skip-existing -j 4 -c deflate
 
+# Valid-pixel footprint (GeoTIFF or JP2) as GeoJSON
+fastfootprint scene.tif -o footprint.geojson
+fastfootprint sar.tif --source nonzero -o swath.geojson
+fastfootprint rpc.tif --georef rpc --rpc-height 120 --dem elevation.tif -o footprint.geojson
+fastfootprint utm_scene.tif --simplify-degrees 0.00001 --format wkt -o footprint.wkt
+fasttranslate footprint-batch ./scenes ./footprints --skip-existing -j 4
+
+# Regenerate committed regression fixtures
+./scripts/generate_footprint_fixtures.sh
+
 # Full COG conversion
 fastcog scene.jp2 output_cog.tif -b 512 -c deflate -j 8 -r nearest
 ```
@@ -98,6 +111,7 @@ gdal-alternate/
 ├── fastvalidate/
 ├── fastcrop/
 ├── fastband/
+├── fastfootprint/
 └── fasttranslate/
 ```
 

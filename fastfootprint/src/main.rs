@@ -3,20 +3,21 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use gdal_alt_core::{
-    extract_footprint, window_from_srcwin, FootprintOptions, ValiditySourceChoice,
+    extract_footprint, window_from_srcwin, FootprintGeorefChoice, FootprintOptions,
+    FootprintOutputFormat, ValiditySourceChoice,
 };
 
 #[derive(Parser, Debug)]
 #[command(
     name = "fastfootprint",
     version,
-    about = "Extract the exact valid-pixel footprint as GeoJSON"
+    about = "Extract the exact valid-pixel footprint as GeoJSON, WKT, or flat coordinates"
 )]
 struct Args {
     /// Input GeoTIFF or JP2 path
     pub input: PathBuf,
 
-    /// Write GeoJSON to this file (stdout when omitted)
+    /// Write output to this file (stdout when omitted)
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
@@ -24,9 +25,41 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SourceArg::Auto)]
     pub source: SourceArg,
 
+    /// Output format: geojson, wkt, or flat
+    #[arg(long, value_enum, default_value_t = FormatArg::GeoJson)]
+    pub format: FormatArg,
+
+    /// Force georef model: auto, affine, rpc, tps, gcp-grid, gcp-affine, pixel
+    #[arg(long)]
+    pub georef: Option<String>,
+
+    /// Maximum GCP count for TPS fitting (subsample denser grids)
+    #[arg(long, default_value_t = 400)]
+    pub tps_max_points: usize,
+
     /// Douglas–Peucker simplification tolerance in map units (0 = none)
     #[arg(long, default_value_t = 0.0)]
     pub simplify: f64,
+
+    /// Douglas–Peucker simplification tolerance in degrees after WGS84 output
+    #[arg(long, default_value_t = 0.0)]
+    pub simplify_degrees: f64,
+
+    /// Keep only the largest validity ring (drop interior holes / speckle rings)
+    #[arg(long)]
+    pub outer_only: bool,
+
+    /// Keep all rings for SAR/nonzero validity (disables auto outer-only)
+    #[arg(long)]
+    pub all_rings: bool,
+
+    /// Constant elevation in meters for RPC georeferencing
+    #[arg(long)]
+    pub rpc_height: Option<f64>,
+
+    /// GeoTIFF DEM path for RPC height refinement
+    #[arg(long)]
+    pub dem: Option<PathBuf>,
 
     /// Do not use associated alpha in auto mode
     #[arg(long)]
@@ -67,6 +100,13 @@ enum SourceArg {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FormatArg {
+    GeoJson,
+    Wkt,
+    Flat,
+}
+
 impl From<SourceArg> for ValiditySourceChoice {
     fn from(value: SourceArg) -> Self {
         match value {
@@ -76,6 +116,16 @@ impl From<SourceArg> for ValiditySourceChoice {
             SourceArg::Nodata => Self::Nodata,
             SourceArg::NonZero => Self::NonZero,
             SourceArg::Full => Self::Full,
+        }
+    }
+}
+
+impl From<FormatArg> for FootprintOutputFormat {
+    fn from(value: FormatArg) -> Self {
+        match value {
+            FormatArg::GeoJson => Self::GeoJson,
+            FormatArg::Wkt => Self::Wkt,
+            FormatArg::Flat => Self::WktFlat,
         }
     }
 }
@@ -102,6 +152,14 @@ fn main() -> Result<()> {
         None
     };
 
+    let georef = match args.georef.as_deref() {
+        Some(value) => Some(
+            FootprintGeorefChoice::parse(value)
+                .ok_or_else(|| anyhow::anyhow!("unknown --georef value: {value}"))?,
+        ),
+        None => None,
+    };
+
     let opts = FootprintOptions {
         source: args.source.into(),
         mask_from_alpha: !args.no_mask_from_alpha,
@@ -110,19 +168,28 @@ fn main() -> Result<()> {
         tile_size: 512,
         nonzero_in_auto: !args.no_nonzero_in_auto,
         zero_threshold: args.zero_threshold,
+        outer_only: args.outer_only,
+        all_rings: args.all_rings,
+        simplify_degrees: args.simplify_degrees,
+        rpc_height: args.rpc_height,
+        dem_path: args.dem.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        georef,
+        tps_max_points: args.tps_max_points,
+        output_format: args.format.into(),
     };
 
     let result = extract_footprint(&input, args.mmap, window, &opts, args.jobs)?;
     if let Some(path) = &args.output {
         gdal_alt_core::util::ensure_parent_dir(path)?;
-        std::fs::write(path, &result.geojson)?;
+        std::fs::write(path, &result.body)?;
     } else {
-        print!("{}", result.geojson);
+        print!("{}", result.body);
     }
 
     eprintln!(
-        "fastfootprint: {} ring(s) from {} validity / {} georef in {:.3}s",
+        "fastfootprint: {} ring(s), {} vertices, {} validity, {} georef in {:.3}s",
         result.ring_count,
+        result.vertex_count,
         result.validity_source,
         result.georef_source,
         started.elapsed().as_secs_f64()

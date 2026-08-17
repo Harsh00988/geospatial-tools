@@ -27,8 +27,9 @@ pub use cog::{
 };
 pub use crop::{shift_transform, window_from_projwin, window_from_srcwin, WriteWindow};
 pub use footprint::{
-    extract_footprint, extract_footprint_geotiff, FootprintOptions, FootprintResult,
-    ResolvedValiditySource, ValiditySourceChoice,
+    extract_footprint, extract_footprint_geotiff, bbox_iou, metrics_close, ring_metrics_from_geojson,
+    FootprintGeorefChoice, FootprintOptions, FootprintOutputFormat, FootprintResult,
+    ResolvedValiditySource, RingMetrics, ValiditySourceChoice,
 };
 pub use info::{format_text, gather, gather_path, RasterInfo};
 pub use input::{detect, detect_source, input_dimensions, InputFormat, RasterProfile, projected_georef};

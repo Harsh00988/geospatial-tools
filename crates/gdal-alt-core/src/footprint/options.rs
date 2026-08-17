@@ -6,6 +6,8 @@ use crate::cog::semantics::{associated_alpha_band_index, black_rgb_candidate, pa
 use crate::input::RasterProfile;
 use tiff_core::PhotometricInterpretation;
 
+use super::georef::FootprintGeorefChoice;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValiditySourceChoice {
     Auto,
@@ -14,6 +16,15 @@ pub enum ValiditySourceChoice {
     Nodata,
     NonZero,
     Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FootprintOutputFormat {
+    #[default]
+    GeoJson,
+    Wkt,
+    /// Space-separated `lon lat` pairs (no geometry header)
+    WktFlat,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +42,22 @@ pub struct FootprintOptions {
     pub nonzero_in_auto: bool,
     /// Absolute threshold for nonzero validity (`0.0` = exact zero only).
     pub zero_threshold: f64,
+    /// Keep only the largest validity ring (drop interior holes / speckle rings).
+    pub outer_only: bool,
+    /// Keep all rings even for SAR/nonzero validity (disables auto outer-only).
+    pub all_rings: bool,
+    /// Douglas–Peucker tolerance in degrees after WGS84 reprojection (0 = none).
+    pub simplify_degrees: f64,
+    /// Constant elevation (meters) for RPC georeferencing instead of the model offset.
+    pub rpc_height: Option<f64>,
+    /// GeoTIFF DEM path for per-pixel RPC height refinement.
+    pub dem_path: Option<String>,
+    /// Force a specific georeferencing model (default: auto-detect).
+    pub georef: Option<FootprintGeorefChoice>,
+    /// Maximum GCP count for thin-plate spline fitting (subsample when denser).
+    pub tps_max_points: usize,
+    /// Output geometry encoding.
+    pub output_format: FootprintOutputFormat,
 }
 
 impl Default for FootprintOptions {
@@ -43,6 +70,14 @@ impl Default for FootprintOptions {
             tile_size: 512,
             nonzero_in_auto: true,
             zero_threshold: 0.0,
+            outer_only: false,
+            all_rings: false,
+            simplify_degrees: 0.0,
+            rpc_height: None,
+            dem_path: None,
+            georef: None,
+            tps_max_points: 400,
+            output_format: FootprintOutputFormat::GeoJson,
         }
     }
 }
@@ -129,7 +164,15 @@ pub fn resolve_validity_source_jp2(
 ) -> Result<ResolvedValiditySource> {
     match opts.source {
         ValiditySourceChoice::Mask => {
-            bail!("--source mask is not supported for JP2 inputs");
+            if jp2_has_mask_channel(profile) || jp2_is_bitmask_dataset(profile) {
+                Ok(if jp2_is_bitmask_dataset(profile) {
+                    ResolvedValiditySource::DatasetMask
+                } else {
+                    ResolvedValiditySource::AssociatedAlpha
+                })
+            } else {
+                bail!("--source mask requested but the JP2 has no opacity/mask channel");
+            }
         }
         ValiditySourceChoice::Alpha => {
             if associated_alpha_band_index(profile).is_none() {
@@ -150,7 +193,10 @@ pub fn resolve_validity_source_jp2(
 }
 
 fn resolve_auto_jp2(profile: &RasterProfile, opts: &FootprintOptions) -> ResolvedValiditySource {
-    if opts.mask_from_alpha && associated_alpha_band_index(profile).is_some() {
+    if jp2_is_bitmask_dataset(profile) && opts.mask_from_alpha {
+        return ResolvedValiditySource::DatasetMask;
+    }
+    if jp2_has_mask_channel(profile) && opts.mask_from_alpha {
         return ResolvedValiditySource::AssociatedAlpha;
     }
     if profile.nodata.is_some() && nodata_value_for_profile(profile).is_some() {
@@ -167,6 +213,17 @@ fn resolve_auto_jp2(profile: &RasterProfile, opts: &FootprintOptions) -> Resolve
 
 pub fn nonzero_candidate(profile: &RasterProfile) -> bool {
     profile.bands == 1 && profile.photometric == PhotometricInterpretation::MinIsBlack
+}
+
+pub fn jp2_has_mask_channel(profile: &RasterProfile) -> bool {
+    associated_alpha_band_index(profile).is_some()
+}
+
+/// Single-band JP2 used as a GDAL-style bitmask dataset (not a greyscale image).
+pub fn jp2_is_bitmask_dataset(profile: &RasterProfile) -> bool {
+    profile.bands == 1
+        && profile.photometric == PhotometricInterpretation::MinIsBlack
+        && profile.sample.bits_per_sample <= 8
 }
 
 pub fn nodata_value_for_profile(profile: &RasterProfile) -> Option<NodataValue> {

@@ -47,7 +47,7 @@ pub fn trace_rings(valid: &[u8], width: usize, height: usize) -> Vec<Vec<(f64, f
         .collect()
 }
 
-fn ring_area(ring: &[(f64, f64)]) -> f64 {
+pub(crate) fn ring_area(ring: &[(f64, f64)]) -> f64 {
     if ring.len() < 3 {
         return 0.0;
     }
@@ -58,6 +58,21 @@ fn ring_area(ring: &[(f64, f64)]) -> f64 {
         area += x0 * y1 - x1 * y0;
     }
     area.abs() * 0.5
+}
+
+/// Keep only the ring with the largest signed area in pixel space.
+pub fn select_largest_ring(mut rings: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
+    if rings.len() <= 1 {
+        return rings;
+    }
+    let largest = rings
+        .drain(..)
+        .max_by(|left, right| {
+            ring_area(left)
+                .partial_cmp(&ring_area(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    largest.map(|ring| vec![ring]).unwrap_or_default()
 }
 
 fn ring_signature(ring: &[(f64, f64)]) -> (usize, i64) {
@@ -129,11 +144,15 @@ fn chain_segments(mut segments: Vec<((f64, f64), (f64, f64))>) -> Vec<Vec<(f64, 
     }
 
     let mut rings = Vec::new();
-    while let Some(start_key) = adjacency
-        .iter()
-        .find(|(_, neighbors)| !neighbors.is_empty())
-        .map(|(key, _)| *key)
-    {
+    loop {
+        let start_key = adjacency
+            .iter()
+            .filter(|(_, neighbors)| !neighbors.is_empty())
+            .map(|(key, _)| *key)
+            .min_by(|left, right| left.cmp(right));
+        let Some(start_key) = start_key else {
+            break;
+        };
         let mut ring = vec![dequantize(start_key)];
         let mut current = start_key;
         let mut prev: Option<(i64, i64)> = None;
@@ -166,6 +185,12 @@ fn chain_segments(mut segments: Vec<((f64, f64), (f64, f64))>) -> Vec<Vec<(f64, 
         }
     }
 
+    rings.sort_by(|left, right| {
+        ring_area(right)
+            .partial_cmp(&ring_area(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.len().cmp(&right.len()))
+    });
     rings
 }
 

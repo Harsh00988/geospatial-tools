@@ -1,0 +1,1 @@
+{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"MultiPolygon","coordinates":[[[[-1.0,1.0],[-0.36,1.0],[-0.36,0.52],[-1.0,0.52],[-1.0,1.0]]]]},"properties":{"crs":"EPSG:4326","epsg":4326,"georef_source":"affine","native_epsg":4326,"validity_source":"full"}}]}

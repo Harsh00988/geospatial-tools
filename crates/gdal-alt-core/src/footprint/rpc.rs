@@ -1,5 +1,63 @@
 const RPC_COEFFICIENT_TAG: u16 = 50844;
 
+use std::sync::Arc;
+
+use super::dem::DemSampler;
+
+#[derive(Debug, Clone)]
+pub struct RpcGeoref {
+    pub model: RpcModel,
+    pub height_mode: RpcHeightMode,
+}
+
+#[derive(Debug, Clone)]
+pub enum RpcHeightMode {
+    ModelOffset,
+    Constant(f64),
+    Dem(Arc<DemSampler>),
+}
+
+impl RpcGeoref {
+    pub fn from_model(model: RpcModel) -> Self {
+        Self {
+            model,
+            height_mode: RpcHeightMode::ModelOffset,
+        }
+    }
+
+    pub fn with_height(mut self, height: f64) -> Self {
+        self.height_mode = RpcHeightMode::Constant(height);
+        self
+    }
+
+    pub fn with_dem(mut self, dem: Arc<DemSampler>) -> Self {
+        self.height_mode = RpcHeightMode::Dem(dem);
+        self
+    }
+
+    pub fn pixel_to_geo(&self, col: f64, row: f64) -> (f64, f64) {
+        match &self.height_mode {
+            RpcHeightMode::ModelOffset => self.model.pixel_to_geo(col, row),
+            RpcHeightMode::Constant(height) => self.model.pixel_to_geo_at_height(col, row, *height),
+            RpcHeightMode::Dem(dem) => {
+                let mut height = self.model.height_off;
+                for _ in 0..5 {
+                    let (lon, lat) = self.model.pixel_to_geo_at_height(col, row, height);
+                    if let Some(sampled) = dem.sample_at_wgs84(lon, lat) {
+                        if (sampled - height).abs() < 1e-4 {
+                            break;
+                        }
+                        height = sampled;
+                    } else {
+                        break;
+                    }
+                }
+                self.model.pixel_to_geo_at_height(col, row, height)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcModel {
     #[allow(dead_code)]
@@ -54,9 +112,12 @@ impl RpcModel {
     }
 
     pub fn pixel_to_geo(&self, col: f64, row: f64) -> (f64, f64) {
+        self.pixel_to_geo_at_height(col, row, self.height_off)
+    }
+
+    pub fn pixel_to_geo_at_height(&self, col: f64, row: f64, height: f64) -> (f64, f64) {
         let line = row;
         let sample = col;
-        let height = self.height_off;
         let mut lat = self.lat_off;
         let mut lon = self.long_off;
 

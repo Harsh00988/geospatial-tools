@@ -24,14 +24,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopenjp2-7-dev
 
+      - name: Generate footprint fixtures
+        run: cargo run -p gdal-alt-core --bin footprint-fixture-gen
+
       - name: Test gdal-alt-core
         run: cargo test -p gdal-alt-core
 
       - name: Encode smoke (in-process fixtures)
         run: cargo test -p gdal-alt-core --test encode_smoke
 
-      - name: Build CLI binaries for optional fixture smoke
-        run: cargo build --release -p fastcog -p fastvalidate
+      - name: Build CLI binaries
+        run: cargo build --release -p fastcog -p fastvalidate -p fastfootprint
 
       - name: CLI encode smoke (when test_data fixtures are present)
         run: |
@@ -40,3 +43,23 @@ jobs:
           else
             echo "No committed test_data fixtures; in-process smoke already passed"
           fi
+
+  footprint-gdal-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenjp2-7-dev gdal-bin
+
+      - name: Generate footprint fixtures
+        run: cargo run -p gdal-alt-core --bin footprint-fixture-gen
+
+      - name: GDAL footprint parity tests
+        run: cargo test -p gdal-alt-core --test footprint_gdal_parity
